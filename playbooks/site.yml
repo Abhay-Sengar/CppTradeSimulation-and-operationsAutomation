@@ -3,7 +3,7 @@
   hosts: trading_nodes
   become: true
   roles:
-    - kernel-tuning
-    - monitoring-agent
-    - trading-app-deploy
-    - bod-checks
+    - { role: kernel-tuning, tags: ['kernel'] }
+    - { role: monitoring-agent, tags: ['monitoring'] }
+    - { role: trading-app-deploy, tags: ['app'] }
+    - { role: bod-checks, tags: ['bod'] }

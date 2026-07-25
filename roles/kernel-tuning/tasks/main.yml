@@ -47,6 +47,12 @@
     dest: /usr/local/sbin/trade-ops-cpu-tuning.sh
     mode: "0755"
 
+- name: Ensure the trade-ops config directory exists
+  ansible.builtin.file:
+    path: /etc/trade-ops
+    state: directory
+    mode: "0755"
+
 - name: Install the CPU-tuning config
   ansible.builtin.template:
     src: cpu-tuning.conf.j2
@@ -103,6 +109,8 @@
       [ "$before" != "$after" ] && changed=1
     done
     echo "irq_affinity_changed=$changed"
+  args:
+    executable: /bin/bash
   register: kernel_tuning_irq_pin
   changed_when: "'irq_affinity_changed=1' in kernel_tuning_irq_pin.stdout"
   failed_when: false
@@ -136,6 +144,8 @@
     else
       grep -o 'PREEMPT[_A-Z]*' /proc/version | head -1 || echo "unknown"
     fi
+  args:
+    executable: /bin/bash
   register: kernel_tuning_preempt
   changed_when: false
   check_mode: false
