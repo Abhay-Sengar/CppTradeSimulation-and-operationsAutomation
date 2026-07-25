@@ -1,5 +1,6 @@
 ---
-# Bind on all interfaces so the VirtualBox NAT port-forward can reach it
-monitoring_netdata_bind: "0.0.0.0:19999"
+# Bind to localhost — the dashboard is viewed on the trading node itself now
+# (bare metal), so there is no reason to expose it on all interfaces.
+monitoring_netdata_bind: "127.0.0.1:19999"
 # Static build keeps everything under /opt/netdata
 monitoring_netdata_conf: "/opt/netdata/etc/netdata/netdata.conf"

@@ -30,25 +30,51 @@
     - Update grub
     - Reboot required
 
-- name: Check whether the CPU frequency governor is exposed
-  ansible.builtin.stat:
-    path: /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
-  register: cpufreq_stat
+- name: Keep every systemd-spawned service off the isolated cores by default
+  # The trading units override this with their own CPUAffinity; isolcpus also
+  # keeps non-pinned tasks (VirtualBox, etc.) off 8-15. Belt and suspenders.
+  ansible.builtin.lineinfile:
+    path: /etc/systemd/system.conf
+    regexp: '^#?\s*CPUAffinity='
+    line: 'CPUAffinity={{ kernel_tuning_housekeeping_cpus }}'
+    backup: true
+  notify: Reboot required
 
-- name: Set CPU governor to performance (only if cpufreq is available)
-  ansible.builtin.shell: |
-    for g in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-      echo performance > "$g"
-    done
-  when: cpufreq_stat.stat.exists
+# ---- CPU tuning applied at boot AND immediately, reversibly ----------------
+- name: Install the CPU-tuning script
+  ansible.builtin.copy:
+    src: trade-ops-cpu-tuning.sh
+    dest: /usr/local/sbin/trade-ops-cpu-tuning.sh
+    mode: "0755"
+
+- name: Install the CPU-tuning config
+  ansible.builtin.template:
+    src: cpu-tuning.conf.j2
+    dest: /etc/trade-ops/cpu-tuning.conf
+    mode: "0644"
+
+- name: Install and enable the trade-ops-cpu boot unit
+  ansible.builtin.template:
+    src: trade-ops-cpu.service.j2
+    dest: /etc/systemd/system/trade-ops-cpu.service
+    mode: "0644"
+
+- name: Enable trade-ops-cpu.service (offlines siblings + governor at every boot)
+  ansible.builtin.systemd:
+    name: trade-ops-cpu.service
+    enabled: true
+    daemon_reload: true
+
+- name: Apply CPU tuning now (immediate + reversible; no reboot needed for this part)
+  ansible.builtin.command: /usr/local/sbin/trade-ops-cpu-tuning.sh
+  register: kernel_tuning_cpu_now
   changed_when: true
+  when: not ansible_check_mode
 
-- name: Note that cpufreq is not exposed (expected inside a VM)
+- name: Show CPU-tuning output
   ansible.builtin.debug:
-    msg: >-
-      cpufreq/scaling_governor not present — governor control is a bare-metal/BIOS
-      step. Skipping (expected in VirtualBox).
-  when: not cpufreq_stat.stat.exists
+    var: kernel_tuning_cpu_now.stdout_lines
+  when: not ansible_check_mode
 
 - name: Collect service facts
   ansible.builtin.service_facts:
@@ -60,6 +86,39 @@
     enabled: false
   when: "'irqbalance.service' in ansible_facts.services"
 
+# ---- IRQ affinity: pin device IRQs to housekeeping cores --------------------
+# Uses smp_affinity_LIST (accepts "0-7" directly) instead of a hex mask — the
+# old hex-mask math was doubly wrong (int() on a range string, and pow(cpu,2)
+# instead of 2**cpu, which silently dropped cpu0). The list form is exact.
+- name: Pin device IRQ affinity to housekeeping cores (best-effort)
+  ansible.builtin.shell: |
+    set -eo pipefail
+    changed=0
+    for irq_dir in /proc/irq/[0-9]*; do
+      aff="$irq_dir/smp_affinity_list"
+      [ -w "$aff" ] || continue
+      before=$(cat "$aff" 2>/dev/null || echo "")
+      echo "{{ kernel_tuning_housekeeping_cpus }}" > "$aff" 2>/dev/null || true
+      after=$(cat "$aff" 2>/dev/null || echo "")
+      [ "$before" != "$after" ] && changed=1
+    done
+    echo "irq_affinity_changed=$changed"
+  register: kernel_tuning_irq_pin
+  changed_when: "'irq_affinity_changed=1' in kernel_tuning_irq_pin.stdout"
+  failed_when: false
+
+- name: Report IRQ-pinning outcome
+  ansible.builtin.debug:
+    msg: >-
+      Pinned writable device IRQs to housekeeping cores
+      ({{ kernel_tuning_housekeeping_cpus }}).
+      {% if 'irq_affinity_changed=1' in (kernel_tuning_irq_pin.stdout | default('')) %}
+      At least one IRQ's affinity was updated.
+      {% else %}
+      No IRQ affinity changed — some IRQs (e.g. per-CPU timers) are not
+      re-routable; the boot-time irqaffinity=0-7 cmdline param covers the rest.
+      {% endif %}
+
 - name: Read effective kernel command line
   ansible.builtin.command: cat /proc/cmdline
   register: cmdline_now
@@ -68,50 +127,6 @@
 - name: Show current kernel command line (reflects new params only AFTER reboot)
   ansible.builtin.debug:
     var: cmdline_now.stdout
-
-- name: Build the housekeeping CPU mask (all cores except the isolated one)
-  ansible.builtin.set_fact:
-    kernel_tuning_housekeeping_mask: >-
-      {{
-        '%x' % (
-          range(ansible_processor_vcpus | default(1) | int)
-          | difference([kernel_tuning_isolated_cpus | default(0) | int])
-          | map('pow', 2)
-          | map('int')
-          | sum
-        )
-      }}
-
-- name: Pin device IRQ affinity to housekeeping cores (best-effort; often a no-op in a VM)
-  ansible.builtin.shell: |
-    set -eo pipefail
-    changed=0
-    for irq_dir in /proc/irq/[0-9]*; do
-      irq=$(basename "$irq_dir")
-      aff="$irq_dir/smp_affinity"
-      [ -w "$aff" ] || continue
-      before=$(cat "$aff" 2>/dev/null | tr -d ',' | sed 's/^0*//')
-      echo "{{ kernel_tuning_housekeeping_mask }}" > "$aff" 2>/dev/null || true
-      after=$(cat "$aff" 2>/dev/null | tr -d ',' | sed 's/^0*//')
-      [ "$before" != "$after" ] && changed=1
-    done
-    echo "irq_affinity_changed=$changed"
-  register: kernel_tuning_irq_pin
-  changed_when: "'irq_affinity_changed=1' in kernel_tuning_irq_pin.stdout"
-  failed_when: false
-
-- name: Report IRQ-pinning outcome (honest about VM limits)
-  ansible.builtin.debug:
-    msg: >-
-      Attempted to pin device IRQs to housekeeping cores (mask
-      0x{{ kernel_tuning_housekeeping_mask }}).
-      {% if 'irq_affinity_changed=1' in (kernel_tuning_irq_pin.stdout | default('')) %}
-      At least one IRQ's affinity was updated.
-      {% else %}
-      No IRQ affinity changed — expected inside VirtualBox, whose virtual IRQ
-      controller usually ignores smp_affinity writes. On bare metal with a
-      multi-queue NIC these writes move each queue's IRQ onto a housekeeping core.
-      {% endif %}
 
 - name: Detect the kernel preemption model (knowledge demonstration only)
   ansible.builtin.shell: |

@@ -1,8 +1,22 @@
 # trade-ops-ansible
 
+> ### ⚠️ v2 (current): C++ engine on bare metal
+> The trading engine and mock exchange were rewritten from Python into a
+> **C++20, lock-free, 3-hop pipeline** (`market-data → strategy → gateway →
+> exchange`, one thread pinned per isolated physical core 8/10/12/14), and the
+> whole stack now runs on the **bare-metal laptop** rather than a VM — the
+> Ansible **control** node is a separate small Alpine VM. The C++ code lives in
+> [`roles/trading-app-deploy/files/cpp/`](roles/trading-app-deploy/files/cpp/)
+> (see its [README](roles/trading-app-deploy/files/cpp/README.md)) and the
+> full interview-topic → file map is in [`INTERVIEW_NOTES.md`](INTERVIEW_NOTES.md).
+> **Those two files + this box are the current source of truth**; the
+> Python/VM-era prose below documents the v1 methodology and is being reconciled.
+> Bare metal means the latency numbers are now real and `perf`-able (isolated
+> cores, invariant TSC, explicit huge pages, SCHED_FIFO), not just relative.
+
 A miniature, fully-automated **trade-operations environment** that mirrors the day-to-day responsibilities of a Trade Operations Engineer at a low-latency / HFT trading firm. It is built and managed entirely with Ansible, runs a simulated FIX order flow with live **tick-to-trade (T2T)** latency measurement, exposes everything on a real-time dashboard, and gates a simulated market open with **Beginning-of-Day (BOD)** readiness checks.
 
-> **Honest framing up front:** this runs inside a VirtualBox VM on a laptop. The *workflows, automation, parameter knowledge, and instrumentation* are production-faithful. The *absolute latency numbers are not* — a VM on a shared host cannot produce production-grade determinism. Throughout, latency figures are treated as a **methodology demonstration** — relative before/after deltas, not absolute microsecond claims.
+> **Honest framing (v1):** the original ran inside a VirtualBox VM on a laptop. The *workflows, automation, parameter knowledge, and instrumentation* are production-faithful. In v1 the *absolute latency numbers were not* — a VM on a shared host cannot produce production-grade determinism. v2 moves the data plane to bare metal, so the numbers are now measured on isolated cores; the methodology framing still holds.
 
 ---
 

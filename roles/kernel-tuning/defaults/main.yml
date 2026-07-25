@@ -1,16 +1,40 @@
 ---
-# Core(s) to isolate for the trading workload. The VM has 4 vCPUs (0,1,2,3) —
-# we isolate cpu 2 and leave 0-1 and 3 for the OS / housekeeping.
-kernel_tuning_isolated_cpus: "2"
+# Isolate all of physical cores 4-7 (logical CPUs 8-15 on this 16-thread
+# Ryzen 7 7730U). The trading engine pins one hot thread per PHYSICAL core —
+# market-data=8, strategy=10, gateway=12, exchange=14 — and the odd SMT
+# siblings (9,11,13,15) are taken OFFLINE by trade-ops-cpu.service so each hot
+# thread owns a whole core with no hyper-thread contention.
+kernel_tuning_isolated_cpus: "8-15"          # string form for the kernel cmdline
+kernel_tuning_isolated_list: [8, 9, 10, 11, 12, 13, 14, 15]  # list form for filters
+kernel_tuning_offline_siblings: [9, 11, 13, 15]
+kernel_tuning_housekeeping_cpus: "0-7"        # everything non-hot runs here
 
-# Explicit 2 MB hugepages to reserve. 64 = 128 MB — modest for a 3 GB VM.
-kernel_tuning_hugepages_count: 64
+# Explicit 2 MB huge pages, reserved on the kernel command line (most reliable —
+# reserved at boot before memory fragments). 512 * 2 MB = 1 GB, ample on 14 GB.
+kernel_tuning_hugepages_count: 512
 
+# CPU governor + turbo policy, applied at boot by trade-ops-cpu.service and also
+# once immediately by the role. Turbo/boost stays ON for a lively demo; set
+# kernel_tuning_disable_turbo: true for benchmark-stable (lower-variance) numbers.
+kernel_tuning_governor: performance
+kernel_tuning_disable_turbo: false
+
+# Parameters appended to the kernel command line (take effect after reboot).
+#   isolcpus     - keep the scheduler from placing normal tasks on 8-15
+#   nohz_full    - stop the 1kHz scheduler tick on those cores (needs rcu_nocbs)
+#   rcu_nocbs    - offload RCU callback processing to housekeeping cores
+#   irqaffinity  - route IRQs to housekeeping cores 0-7 from boot
+#   transparent_hugepage=never - use explicit huge pages, not THP (no khugepaged jitter)
+#   default_hugepagesz/hugepagesz/hugepages - reserve the 2 MB pool early
 kernel_tuning_cmdline_params:
   - "isolcpus={{ kernel_tuning_isolated_cpus }}"
   - "nohz_full={{ kernel_tuning_isolated_cpus }}"
   - "rcu_nocbs={{ kernel_tuning_isolated_cpus }}"
+  - "irqaffinity={{ kernel_tuning_housekeeping_cpus }}"
   - "transparent_hugepage=never"
+  - "default_hugepagesz=2M"
+  - "hugepagesz=2M"
+  - "hugepages={{ kernel_tuning_hugepages_count }}"
 
 # Keys that exist on essentially every kernel — safe to set hard.
 kernel_tuning_sysctls:

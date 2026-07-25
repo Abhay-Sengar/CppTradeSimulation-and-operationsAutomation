@@ -1,0 +1,10 @@
+---
+# Fallback inventory: run the SAME playbook directly on the trading node itself,
+# with no SSH hop. Use this if the ops-node VM misbehaves mid-demo:
+#   ansible-playbook -i inventory/local.yml playbooks/site.yml -K
+all:
+  children:
+    trading_nodes:
+      hosts:
+        trading-node:
+          ansible_connection: local

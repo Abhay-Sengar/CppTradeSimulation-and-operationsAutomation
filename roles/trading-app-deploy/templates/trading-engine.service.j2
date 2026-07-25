@@ -1,16 +1,24 @@
+{{ ansible_managed | comment }}
 [Unit]
-Description=FIX trading engine (initiator) with tick-to-trade metrics
-After=mock-exchange.service
+Description=C++ trading engine (3-hop lock-free pipeline) with tick-to-trade metrics
+After=mock-exchange.service trade-ops-cpu.service
 Requires=mock-exchange.service
 
 [Service]
 Type=simple
 User={{ trading_app_user }}
-ExecStart={{ trading_venv }}/bin/python {{ trading_app_dir }}/trading_engine.py
+ExecStart={{ trading_app_dir }}/bin/trading_engine \
+  --dispatch={{ trading_dispatch }} --alloc={{ trading_alloc }} --huge={{ trading_huge }} \
+  --pin=on --rt=on --rate={{ trading_rate }} \
+  --md-cpu={{ trading_md_cpu }} --strat-cpu={{ trading_strategy_cpu }} --gw-cpu={{ trading_gateway_cpu }}
 Restart=on-failure
 RestartSec=2
-# Pin the hot path to the isolated core
-CPUAffinity={{ trading_engine_cpu }}
+# The engine pins market-data/strategy/gateway internally to their exact cores;
+# this unit-level affinity is the outer guard rail. RT + memory locking as above.
+CPUAffinity={{ trading_md_cpu }} {{ trading_strategy_cpu }} {{ trading_gateway_cpu }}
+LimitRTPRIO=99
+LimitMEMLOCK=infinity
+AmbientCapabilities=CAP_SYS_NICE CAP_IPC_LOCK
 
 [Install]
 WantedBy=multi-user.target

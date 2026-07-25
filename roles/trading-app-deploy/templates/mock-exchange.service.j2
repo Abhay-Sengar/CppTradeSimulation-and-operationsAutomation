@@ -1,13 +1,20 @@
+{{ ansible_managed | comment }}
 [Unit]
-Description=Mock FIX exchange (acceptor)
-After=network.target
+Description=Mock FIX 4.2 exchange (C++ acceptor)
+After=network.target trade-ops-cpu.service
 
 [Service]
 Type=simple
 User={{ trading_app_user }}
-ExecStart={{ trading_venv }}/bin/python {{ trading_app_dir }}/mock_exchange.py
+ExecStart={{ trading_app_dir }}/bin/mock_exchange --cpu={{ trading_exchange_cpu }} --pin=on --rt=on --rtprio={{ trading_rt_prio }}
 Restart=on-failure
 RestartSec=2
+# Pin to the isolated exchange core; allow SCHED_FIFO + mlockall for a non-root
+# user via ambient capabilities (email: SCHED_FIFO needs CAP_SYS_NICE).
+CPUAffinity={{ trading_exchange_cpu }}
+LimitRTPRIO=99
+LimitMEMLOCK=infinity
+AmbientCapabilities=CAP_SYS_NICE CAP_IPC_LOCK
 
 [Install]
 WantedBy=multi-user.target
