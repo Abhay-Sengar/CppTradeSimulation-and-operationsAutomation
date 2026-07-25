@@ -1,0 +1,8 @@
+[Unit]
+Description=Beginning-of-Day trading node readiness checks
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/bod_check.sh
+# Exit 1 ("ready with warnings") is acceptable; exit 2 ("not ready") stays a real failure
+SuccessExitStatus=1

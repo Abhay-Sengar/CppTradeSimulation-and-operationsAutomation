@@ -1,0 +1,8 @@
+# Managed by Ansible (bod-checks role) — do not edit by hand
+DISK_WARN_PCT={{ bod_checks_disk_warn_pct }}
+MEM_WARN_PCT={{ bod_checks_mem_warn_pct }}
+CLOCK_OFFSET_MAX_MS={{ bod_checks_clock_offset_max_ms }}
+EXCHANGE_HOST={{ bod_checks_exchange_host }}
+EXCHANGE_PORT={{ bod_checks_exchange_port }}
+ISOLATED_CPUS="{{ bod_checks_isolated_cpus }}"
+SERVICES="{{ bod_checks_services | join(' ') }}"

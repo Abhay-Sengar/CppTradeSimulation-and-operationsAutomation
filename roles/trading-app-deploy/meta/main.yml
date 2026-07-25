@@ -1,0 +1,13 @@
+---
+galaxy_info:
+  author: Abhay Pratap Singh
+  description: Deploys the mock FIX exchange and trading engine with tick-to-trade metrics.
+  company: Portfolio project
+  license: MIT
+  min_ansible_version: "2.15"
+  platforms:
+    - name: Ubuntu
+      versions:
+        - noble
+  galaxy_tags: []
+dependencies: []

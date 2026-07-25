@@ -1,0 +1,8 @@
+---
+trading_app_dir: /opt/trade-ops/app
+trading_venv: /opt/trade-ops/venv
+trading_app_user: trader
+trading_metrics_port: 8000
+trading_exchange_port: 9001
+# Pin the engine to the isolated core from the kernel-tuning role
+trading_engine_cpu: "{{ kernel_tuning_isolated_cpus | default('2') }}"

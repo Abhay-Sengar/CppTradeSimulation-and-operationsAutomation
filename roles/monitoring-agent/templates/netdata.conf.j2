@@ -1,0 +1,7 @@
+[web]
+  bind to = {{ monitoring_netdata_bind }}
+
+# Per-core CPU utilization is off by default in Netdata; enable it so the
+# isolated trading core (isolcpus=2) is visible as its own chart on the dashboard.
+[plugin:proc:/proc/stat]
+  per cpu core utilization = yes

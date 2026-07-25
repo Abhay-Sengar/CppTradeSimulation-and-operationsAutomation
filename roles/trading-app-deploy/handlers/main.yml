@@ -1,0 +1,16 @@
+---
+- name: Reload systemd
+  ansible.builtin.systemd:
+    daemon_reload: true
+
+- name: Restart mock exchange
+  ansible.builtin.systemd:
+    name: mock-exchange
+    state: restarted
+  when: not ansible_check_mode
+
+- name: Restart trading engine
+  ansible.builtin.systemd:
+    name: trading-engine
+    state: restarted
+  when: not ansible_check_mode

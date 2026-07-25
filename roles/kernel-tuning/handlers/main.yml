@@ -1,0 +1,10 @@
+---
+- name: Update grub
+  ansible.builtin.command: update-grub
+  changed_when: true
+
+- name: Reboot required
+  ansible.builtin.debug:
+    msg: >-
+      GRUB cmdline changed. Because the control node is co-located on this VM,
+      reboot it manually: 'sudo reboot', reconnect, then verify /proc/cmdline.

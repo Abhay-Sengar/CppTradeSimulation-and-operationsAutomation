@@ -1,0 +1,13 @@
+[Unit]
+Description=Mock FIX exchange (acceptor)
+After=network.target
+
+[Service]
+Type=simple
+User={{ trading_app_user }}
+ExecStart={{ trading_venv }}/bin/python {{ trading_app_dir }}/mock_exchange.py
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

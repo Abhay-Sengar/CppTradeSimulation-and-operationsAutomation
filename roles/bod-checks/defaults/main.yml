@@ -1,0 +1,14 @@
+---
+bod_checks_timezone: "Asia/Kolkata"
+bod_checks_oncalendar: "Mon..Fri 08:45"
+bod_checks_disk_warn_pct: 85
+bod_checks_mem_warn_pct: 90
+bod_checks_clock_offset_max_ms: 50
+bod_checks_exchange_host: "127.0.0.1"
+bod_checks_exchange_port: 9001
+bod_checks_services:
+  - ssh
+  - netdata
+  - mock-exchange
+  - trading-engine
+bod_checks_isolated_cpus: "{{ kernel_tuning_isolated_cpus | default('2') }}"

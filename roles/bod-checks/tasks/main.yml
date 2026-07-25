@@ -1,0 +1,66 @@
+---
+- name: Install BOD dependencies
+  ansible.builtin.apt:
+    name:
+      - chrony
+      - netcat-openbsd
+      - bsdextrautils
+    state: present
+    update_cache: false
+
+- name: Get current timezone
+  ansible.builtin.command: timedatectl show -p Timezone --value
+  register: bod_current_tz
+  changed_when: false
+  check_mode: false
+
+- name: Set system timezone to {{ bod_checks_timezone }}
+  ansible.builtin.command: "timedatectl set-timezone {{ bod_checks_timezone }}"
+  when: bod_current_tz.stdout != bod_checks_timezone
+  changed_when: true
+
+- name: Ensure chrony is running
+  ansible.builtin.systemd:
+    name: chrony
+    state: started
+    enabled: true
+
+- name: Create config directory
+  ansible.builtin.file:
+    path: /etc/trade-ops
+    state: directory
+    mode: "0755"
+
+- name: Deploy BOD config
+  ansible.builtin.template:
+    src: bod.conf.j2
+    dest: /etc/trade-ops/bod.conf
+    mode: "0644"
+
+- name: Deploy BOD check script
+  ansible.builtin.copy:
+    src: bod_check.sh
+    dest: /usr/local/bin/bod_check.sh
+    mode: "0755"
+
+- name: Install BOD systemd service
+  ansible.builtin.template:
+    src: bod-check.service.j2
+    dest: /etc/systemd/system/bod-check.service
+    mode: "0644"
+  notify: Reload systemd
+
+- name: Install BOD systemd timer
+  ansible.builtin.template:
+    src: bod-check.timer.j2
+    dest: /etc/systemd/system/bod-check.timer
+    mode: "0644"
+  notify: Reload systemd
+
+- name: Enable and start the BOD timer
+  ansible.builtin.systemd:
+    name: bod-check.timer
+    state: started
+    enabled: true
+    daemon_reload: true
+  when: not ansible_check_mode

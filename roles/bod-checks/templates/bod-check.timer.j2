@@ -1,0 +1,9 @@
+[Unit]
+Description=Run BOD checks before market open
+
+[Timer]
+OnCalendar={{ bod_checks_oncalendar }}
+Persistent=true
+
+[Install]
+WantedBy=timers.target

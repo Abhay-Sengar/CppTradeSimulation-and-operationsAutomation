@@ -1,0 +1,93 @@
+---
+- name: Install Python venv support
+  ansible.builtin.apt:
+    name:
+      - python3-venv
+      - python3-pip
+    state: present
+    update_cache: false
+
+- name: Create the app directory
+  ansible.builtin.file:
+    path: "{{ trading_app_dir }}"
+    state: directory
+    mode: "0755"
+
+- name: Create the virtualenv
+  ansible.builtin.command:
+    cmd: "python3 -m venv {{ trading_venv }}"
+    creates: "{{ trading_venv }}/bin/python"
+
+- name: Install FIX + metrics libraries into the venv
+  ansible.builtin.pip:
+    name:
+      - simplefix
+      - prometheus-client
+    virtualenv: "{{ trading_venv }}"
+
+- name: Deploy mock exchange
+  ansible.builtin.copy:
+    src: mock_exchange.py
+    dest: "{{ trading_app_dir }}/mock_exchange.py"
+    mode: "0755"
+  notify: Restart mock exchange
+
+- name: Deploy trading engine
+  ansible.builtin.copy:
+    src: trading_engine.py
+    dest: "{{ trading_app_dir }}/trading_engine.py"
+    mode: "0755"
+  notify: Restart trading engine
+
+- name: Own the app tree as the app user
+  ansible.builtin.file:
+    path: /opt/trade-ops
+    state: directory
+    owner: "{{ trading_app_user }}"
+    group: "{{ trading_app_user }}"
+    recurse: true
+
+- name: Install mock exchange systemd unit
+  ansible.builtin.template:
+    src: mock-exchange.service.j2
+    dest: /etc/systemd/system/mock-exchange.service
+    mode: "0644"
+  notify:
+    - Reload systemd
+    - Restart mock exchange
+
+- name: Install trading engine systemd unit
+  ansible.builtin.template:
+    src: trading-engine.service.j2
+    dest: /etc/systemd/system/trading-engine.service
+    mode: "0644"
+  notify:
+    - Reload systemd
+    - Restart trading engine
+
+- name: Ensure Netdata go.d directory exists
+  ansible.builtin.file:
+    path: /opt/netdata/etc/netdata/go.d
+    state: directory
+    mode: "0755"
+
+- name: Tell Netdata to scrape the engine's metrics
+  ansible.builtin.copy:
+    content: |
+      jobs:
+        - name: trading_engine
+          url: http://127.0.0.1:{{ trading_metrics_port }}/metrics
+    dest: /opt/netdata/etc/netdata/go.d/prometheus.conf
+    mode: "0644"
+  notify: Restart netdata
+
+- name: Enable and start the trading services
+  ansible.builtin.systemd:
+    name: "{{ item }}"
+    state: started
+    enabled: true
+    daemon_reload: true
+  loop:
+    - mock-exchange
+    - trading-engine
+  when: not ansible_check_mode

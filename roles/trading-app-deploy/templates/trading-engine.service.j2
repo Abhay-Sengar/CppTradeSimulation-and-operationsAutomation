@@ -1,0 +1,16 @@
+[Unit]
+Description=FIX trading engine (initiator) with tick-to-trade metrics
+After=mock-exchange.service
+Requires=mock-exchange.service
+
+[Service]
+Type=simple
+User={{ trading_app_user }}
+ExecStart={{ trading_venv }}/bin/python {{ trading_app_dir }}/trading_engine.py
+Restart=on-failure
+RestartSec=2
+# Pin the hot path to the isolated core
+CPUAffinity={{ trading_engine_cpu }}
+
+[Install]
+WantedBy=multi-user.target
