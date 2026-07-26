@@ -12,16 +12,29 @@ The live pipeline is `market-data (cpu8) → strategy (cpu10) → gateway (cpu12
 exchange (cpu14)`, three SPSC rings, FIX/TCP loopback, all under
 `roles/trading-app-deploy/files/cpp/`.
 
-Measured on this box (AMD Ryzen 7 7730U, microbench, min ns/op):
+Measured on this box (AMD Ryzen 7 7730U, isolated cores, `performance`
+governor, RT throttling disabled — microbench min ns/op):
 
 | A/B | A | B | ratio |
 |---|---|---|---|
-| dispatch: CRTP vs virtual | 0.68 ns | 1.36 ns | 2.0× |
-| alloc: pool vs malloc | 4.4 ns | 17.7 ns | 4.0× |
-| map: flat vs `unordered_map` | 1.4 ns | 2.4 ns | 1.7× |
+| dispatch: CRTP vs virtual | 0.46 ns | 0.94 ns | 2.06× |
+| alloc: pool vs malloc | 2.88 ns | 12.58 ns | 4.36× |
+| map: flat vs `unordered_map` | 1.02 ns | 1.67 ns | 1.64× |
 
-Live pipeline latency: `pipeline` p50 ≈ 0.77 µs (in-process), `tick_to_trade`
-p50 ≈ 24 µs (TCP-round-trip-dominated → the kernel-bypass motivation).
+Live pipeline latency on the isolated cores (from `:8000/metrics`):
+
+| histogram | p50 | p99 | p999 | max |
+|---|---|---|---|---|
+| `pipeline` (in-process, md→gateway) | 588 ns | 1.58 µs | 2.0 µs | 2.5 µs |
+| `tick_to_trade` (full TCP round trip) | 43 µs | 59 µs | 67 µs | — |
+
+The ~0.6µs pipeline vs ~43µs tick-to-trade gap is the kernel/TCP stack cost —
+the live motivation for kernel bypass. Getting the pipeline tail down to ~2µs
+required: isolcpus + nohz_full + SCHED_FIFO **with RT throttling disabled**
+(`kernel.sched_rt_runtime_us=-1`) so the pinned FIFO thread is never stalled,
+and keeping the non-hot threads (logger/metrics) on housekeeping cores. Before
+that tuning the p99 was ~880 ms (RT throttle stalling the gateway) — a concrete
+lesson in why each knob matters.
 
 ---
 

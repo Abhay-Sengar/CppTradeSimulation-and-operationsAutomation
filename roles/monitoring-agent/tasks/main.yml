@@ -1,20 +1,17 @@
 ---
-- name: Download Netdata kickstart installer
-  ansible.builtin.get_url:
-    url: https://get.netdata.cloud/kickstart.sh
-    dest: /tmp/netdata-kickstart.sh
-    mode: "0755"
-    force: false
+# Install Netdata from the Ubuntu archive. This replaces the upstream static
+# kickstart, which silently failed on this box (exited 0 but produced no
+# binary — a flaky remote tarball download). The apt package is reliable, binds
+# localhost by default, and puts config under /etc/netdata.
+- name: Install Netdata (Ubuntu package)
+  ansible.builtin.apt:
+    name: netdata
+    state: present
+    update_cache: false
 
-- name: Install Netdata (self-contained static build, works on any distro)
-  ansible.builtin.command: >
-    sh /tmp/netdata-kickstart.sh
-    --static-only --non-interactive --stable-channel
-    --disable-telemetry --no-updates
-  args:
-    creates: /opt/netdata/usr/sbin/netdata
-
-- name: Configure Netdata web binding for port-forward access
+- name: Configure Netdata web binding + per-core CPU (override file)
+  # netdata.conf is override-only: unspecified keys fall back to built-in
+  # defaults, so a minimal file is valid and safe.
   ansible.builtin.template:
     src: netdata.conf.j2
     dest: "{{ monitoring_netdata_conf }}"

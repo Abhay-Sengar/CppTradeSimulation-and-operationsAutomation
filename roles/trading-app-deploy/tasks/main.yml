@@ -83,7 +83,7 @@
 
 - name: Ensure Netdata go.d directory exists
   ansible.builtin.file:
-    path: /opt/netdata/etc/netdata/go.d
+    path: /etc/netdata/go.d
     state: directory
     mode: "0755"
 
@@ -93,7 +93,7 @@
       jobs:
         - name: trading_engine
           url: http://127.0.0.1:{{ trading_metrics_port }}/metrics
-    dest: /opt/netdata/etc/netdata/go.d/prometheus.conf
+    dest: /etc/netdata/go.d/prometheus.conf
     mode: "0644"
   notify: Restart netdata
 

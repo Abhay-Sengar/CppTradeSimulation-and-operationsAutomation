@@ -40,6 +40,12 @@ kernel_tuning_cmdline_params:
 kernel_tuning_sysctls:
   vm.swappiness: "10"
   vm.stat_interval: "120"
+  # Disable RT bandwidth throttling. By default the kernel throttles SCHED_FIFO
+  # to 95% (a ~50ms stall every 1s) so normal tasks can run. On an isolated core
+  # that runs ONLY its one pinned FIFO hot thread, that stall is pure tail
+  # latency — so we let FIFO run 100%. Safe here because nothing else is
+  # scheduled on the isolated cores and housekeeping (0-7) is untouched.
+  kernel.sched_rt_runtime_us: "-1"
   vm.nr_hugepages: "{{ kernel_tuning_hugepages_count }}"
   net.core.rmem_max: "16777216"
   net.core.wmem_max: "16777216"

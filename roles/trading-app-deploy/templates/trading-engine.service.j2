@@ -13,9 +13,10 @@ ExecStart={{ trading_app_dir }}/bin/trading_engine \
   --md-cpu={{ trading_md_cpu }} --strat-cpu={{ trading_strategy_cpu }} --gw-cpu={{ trading_gateway_cpu }}
 Restart=on-failure
 RestartSec=2
-# The engine pins market-data/strategy/gateway internally to their exact cores;
-# this unit-level affinity is the outer guard rail. RT + memory locking as above.
-CPUAffinity={{ trading_md_cpu }} {{ trading_strategy_cpu }} {{ trading_gateway_cpu }}
+# Allow housekeeping cores (for logger/metrics/main) AND the isolated cores the
+# hot threads pin themselves to. isolcpus keeps the unpinned threads on 0-7 while
+# md/strategy/gateway pin to 8/10/12. (Overrides the global CPUAffinity=0-7.)
+CPUAffinity={{ trading_housekeeping_cpus }} {{ trading_md_cpu }} {{ trading_strategy_cpu }} {{ trading_gateway_cpu }}
 LimitRTPRIO=99
 LimitMEMLOCK=infinity
 AmbientCapabilities=CAP_SYS_NICE CAP_IPC_LOCK

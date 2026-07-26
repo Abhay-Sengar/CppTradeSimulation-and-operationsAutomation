@@ -9,9 +9,10 @@ User={{ trading_app_user }}
 ExecStart={{ trading_app_dir }}/bin/mock_exchange --cpu={{ trading_exchange_cpu }} --pin=on --rt=on --rtprio={{ trading_rt_prio }}
 Restart=on-failure
 RestartSec=2
-# Pin to the isolated exchange core; allow SCHED_FIFO + mlockall for a non-root
-# user via ambient capabilities (email: SCHED_FIFO needs CAP_SYS_NICE).
-CPUAffinity={{ trading_exchange_cpu }}
+# Housekeeping cores for the acceptor thread + the isolated core the connection
+# handler pins to. Allow SCHED_FIFO + mlockall for a non-root user via ambient
+# capabilities (email: SCHED_FIFO needs CAP_SYS_NICE).
+CPUAffinity={{ trading_housekeeping_cpus }} {{ trading_exchange_cpu }}
 LimitRTPRIO=99
 LimitMEMLOCK=infinity
 AmbientCapabilities=CAP_SYS_NICE CAP_IPC_LOCK
