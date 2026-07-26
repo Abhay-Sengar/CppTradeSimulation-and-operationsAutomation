@@ -59,6 +59,49 @@ Four planes: **control** (Ansible), **data** (C++ engine + mock exchange),
 **monitoring** (netdata), **readiness** (BOD checks). One hot thread per isolated
 physical core; SPSC lock-free rings between hops; non-hot threads on housekeeping.
 
+### Live core map — what runs on each logical CPU
+
+```mermaid
+flowchart TB
+  subgraph HK["HOUSEKEEPING · cpu 0-7 · SCHED_OTHER"]
+    direction LR
+    os["OS · systemd · sshd"]
+    nd["netdata :19999"]
+    em["engine: main"]
+    el["engine: logger"]
+    eh["engine: metrics-http :8000"]
+    ea["exchange: acceptor"]
+  end
+  subgraph ISO["ISOLATED · SCHED_FIFO · nohz_full · one hot thread per core"]
+    direction LR
+    c8["cpu 8<br/>market-data"]
+    c10["cpu 10<br/>strategy"]
+    c12["cpu 12<br/>gateway"]
+    c14["cpu 14<br/>mock-exchange<br/>handler"]
+  end
+  subgraph OFF["OFFLINE · SMT siblings"]
+    direction LR
+    c9["cpu 9"]
+    c11["cpu 11"]
+    c13["cpu 13"]
+    c15["cpu 15"]
+  end
+  c8 -->|"ring1 · Tick"| c10
+  c10 -->|"ring2 · Order+FIX"| c12
+  c12 -->|"FIX NewOrderSingle · TCP :9001"| c14
+  c14 -->|"ExecutionReport"| c12
+  c12 -->|"ring3 · LogEvent"| el
+  eh -->|":8000/metrics"| nd
+  classDef off fill:#eee,stroke:#bbb,color:#999,stroke-dasharray:4 3;
+  class c9,c11,c13,c15 off;
+  classDef hot fill:#0b7,stroke:#065,color:#fff;
+  class c8,c10,c12,c14 hot;
+```
+
+The `t2t` metric covers `cpu8 → cpu10 → cpu12` (in-process, ~0.6 µs); `rtt` adds
+the `cpu12 ⇄ cpu14` loopback FIX hop (~43 µs). Cores 9/11/13/15 are offlined so
+each hot thread owns a full physical core.
+
 ---
 
 ## Repository structure
@@ -182,6 +225,7 @@ NUMA-aware placement, PTP time sync, redundant paths + sub-ms failover.
 C++20 (GCC, CMake) · Ansible · Netdata · systemd · chrony · `tc/netem` ·
 `perf`/`strace` · Linux CPU isolation · VirtualBox (control-node VM) · Git.
 
-**For the full design, the complete rdtsc/metrics methodology, the A/B data, and
-the debugging war stories, read [`ProjectDeepDive.md`](ProjectDeepDive.md). For
-the interview-topic → file map, see [`INTERVIEW_NOTES.md`](INTERVIEW_NOTES.md).**
+**Docs:** [`RUNBOOK.md`](RUNBOOK.md) — start/stop, dashboard, BOD, self-heal, and
+demos, command-first · [`ProjectDeepDive.md`](ProjectDeepDive.md) — full design,
+rdtsc/metrics methodology, A/B data, debugging war stories ·
+[`INTERVIEW_NOTES.md`](INTERVIEW_NOTES.md) — interview-topic → file map.
