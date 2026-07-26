@@ -1,206 +1,187 @@
-# trade-ops-ansible
+# CppTradeSimulation & Operations Automation
 
-> ### ⚠️ v2 (current): C++ engine on bare metal
-> The trading engine and mock exchange were rewritten from Python into a
-> **C++20, lock-free, 3-hop pipeline** (`market-data → strategy → gateway →
-> exchange`, one thread pinned per isolated physical core 8/10/12/14), and the
-> whole stack now runs on the **bare-metal laptop** rather than a VM — the
-> Ansible **control** node is a separate small Alpine VM. The C++ code lives in
-> [`roles/trading-app-deploy/files/cpp/`](roles/trading-app-deploy/files/cpp/)
-> (see its [README](roles/trading-app-deploy/files/cpp/README.md)) and the
-> full interview-topic → file map is in [`INTERVIEW_NOTES.md`](INTERVIEW_NOTES.md).
-> **Those two files + this box are the current source of truth**; the
-> Python/VM-era prose below documents the v1 methodology and is being reconciled.
-> Bare metal means the latency numbers are now real and `perf`-able (isolated
-> cores, invariant TSC, explicit huge pages, SCHED_FIFO), not just relative.
+A low-latency **C++20 trading engine** — a lock-free, 3-hop pipeline pinned to
+isolated CPU cores on bare-metal Linux — together with the **Ansible automation**
+that tunes the box, deploys the workload, monitors it, and gates the market open
+with Beginning-of-Day checks. Built to exercise the HFT C++ and Linux
+low-latency skill set end to end.
 
-A miniature, fully-automated **trade-operations environment** that mirrors the day-to-day responsibilities of a Trade Operations Engineer at a low-latency / HFT trading firm. It is built and managed entirely with Ansible, runs a simulated FIX order flow with live **tick-to-trade (T2T)** latency measurement, exposes everything on a real-time dashboard, and gates a simulated market open with **Beginning-of-Day (BOD)** readiness checks.
-
-> **Honest framing (v1):** the original ran inside a VirtualBox VM on a laptop. The *workflows, automation, parameter knowledge, and instrumentation* are production-faithful. In v1 the *absolute latency numbers were not* — a VM on a shared host cannot produce production-grade determinism. v2 moves the data plane to bare metal, so the numbers are now measured on isolated cores; the methodology framing still holds.
+> **Honest framing:** the *engine, isolation, measurement, and automation are
+> real and run on bare metal* (AMD Ryzen 7 7730U, isolated cores, invariant TSC,
+> explicit huge pages, `SCHED_FIFO`). The transport is loopback TCP (not a real
+> exchange link), so the round-trip number includes the mock exchange + kernel —
+> the number the engine *owns* is the in-process tick-to-trade (`t2t`). See
+> [`ProjectDeepDive.md`](ProjectDeepDive.md) §6 and §17.
 
 ---
 
-## What this demonstrates
+## Headline numbers (bare metal, isolated cores, `performance` governor)
 
-This project deliberately exercises every line of the Trade Operations Engineer job description:
+**Engine tick-to-trade** (`t2t` — tick generated → order ready to send, 100%
+in-process):
 
-- **Low-latency infrastructure management** — kernel tuning for CPU isolation, hugepages, and network latency, applied idempotently with Ansible.
-- **Automation with Ansible** — playbooks, roles, inventory, handlers, `--check` mode, and `ansible-lint` clean at the `production` profile.
-- **Linux kernel parameter tuning** — `isolcpus` / `nohz_full` / `rcu_nocbs`, Transparent Huge Pages disabled, explicit hugepages, a set of low-latency network sysctls, IRQ-affinity pinning to housekeeping cores, and preemption-model detection.
-- **Beginning-of-Day checks** — a readiness script run pre-open by a systemd timer, gating the market open.
-- **Monitoring & alerting** — a live dashboard with per-core CPU, interrupts, context switches, network, and a **custom tick-to-trade histogram** from the trading engine.
-- **End-to-end stack literacy** — a simulated FIX 4.2 session (logon, orders, execution reports) between a trading engine and a mock exchange.
-- **Troubleshooting latency / high availability** — two live demos: `tc/netem` latency injection (watch T2T spike on the dashboard) and a failover/self-heal demo (kill a service, watch systemd recover it).
+| p50 | p99 | p999 | max |
+|---|---|---|---|
+| **588 ns** | **1.58 µs** | **2.0 µs** | 2.5 µs |
+
+**Round trip** (`rtt` — tick → fill, includes the mock exchange + kernel TCP):
+p50 43 µs · p99 59 µs · p999 67 µs. The ~70× gap is the kernel/TCP cost — the
+live motivation for kernel bypass.
+
+**Microbenchmark A/B** (why the banned constructs are banned):
+
+| dispatch CRTP vs `virtual` | alloc pool vs `malloc` | map flat vs `unordered_map` |
+|---|---|---|
+| 0.46 → 0.94 ns (**2.06×**) | 2.88 → 12.58 ns (**4.36×**) | 1.02 → 1.67 ns (**1.64×**) |
 
 ---
 
 ## Architecture
 
-Four logical planes run on a single Ubuntu "trading node" VM:
-
-| Plane | Components | Purpose |
-|---|---|---|
-| **Control plane** | Ansible (control node) | Deploys and configures everything over SSH; the single source of truth (Infrastructure-as-Code). |
-| **Data plane** | Trading Engine (FIX initiator), Mock Exchange (FIX acceptor) | Simulated order flow; the engine is pinned to the isolated CPU core. |
-| **Monitoring plane** | Netdata agent + dbengine TSDB | Collects system metrics and scrapes the engine's tick-to-trade metrics; serves the dashboard. |
-| **Readiness plane** | BOD checks (systemd service + timer) | Verifies the node is market-ready before the open. |
-
-```mermaid
-flowchart LR
-    subgraph client ["Operators & Control Plane"]
-        operatorBrowser["Operator Browser"]
-        ansibleControl["Ansible Control Node (CLI)"]
-    end
-    subgraph gateway ["Host Edge"]
-        portForward["VirtualBox NAT Port-Forward"]
-    end
-    subgraph service ["Trading Node Services (Ubuntu VM)"]
-        tradingEngine["Trading Engine - FIX Initiator (pinned CPU2)"]
-        mockExchange["Mock Exchange - FIX Acceptor"]
-        netdata["Netdata Agent"]
-        bodChecks["BOD Checks (systemd timer)"]
-    end
-    subgraph datastore ["Time-Series Storage"]
-        netdataTSDB["Netdata dbengine TSDB"]
-    end
-    subgraph external ["External"]
-        github["GitHub - IaC Repo"]
-    end
-
-    operatorBrowser -->|"Views :19999"| portForward
-    portForward -->|"Forwards :19999"| netdata
-    ansibleControl -->|"Deploy/Configure SSH"| tradingEngine
-    ansibleControl -->|"Deploy/Configure SSH"| mockExchange
-    ansibleControl -->|"Install Agent SSH"| netdata
-    ansibleControl -->|"Install Timer SSH"| bodChecks
-    ansibleControl -.->|"GitHub: Push IaC"| github
-    tradingEngine <-->|"FIX session: orders / fills"| mockExchange
-    tradingEngine -->|"Exposes T2T :8000"| netdata
-    netdata -->|"Read/Write series"| netdataTSDB
-    bodChecks -->|"Readiness probe"| tradingEngine
-    bodChecks -->|"Probe :9001"| mockExchange
 ```
+┌── LAPTOP (bare metal, Ubuntu 22.04) ──────────────────────────────────────┐
+│  Housekeeping cpu 0-7              Isolated cpu 8,10,12,14 (phys cores 4-7) │
+│   ├ OS / systemd / netdata          ├ market-data ─ring1─▶ strategy        │
+│   ├ engine: logger + metrics-http   │      (cpu8)          (cpu10)          │
+│   └ sshd (Ansible target)           │                         │ ring2       │
+│                                     │                         ▼             │
+│   SMT siblings 9,11,13,15 OFFLINE   ├ mock-exchange ◀─FIX/TCP─ gateway      │
+│                                     └   (cpu14)     :9001     (cpu12)        │
+│   engine :8000/metrics  ──▶ netdata :19999                                  │
+└────────────────────────────┬──────────────────────────────────────────────┘
+                             │ host-only 192.168.56.x
+                  ┌──────────▼─────────┐
+                  │ ops-node (Alpine VM)│  Ansible control node (optional)
+                  └────────────────────┘
+```
+
+Four planes: **control** (Ansible), **data** (C++ engine + mock exchange),
+**monitoring** (netdata), **readiness** (BOD checks). One hot thread per isolated
+physical core; SPSC lock-free rings between hops; non-hot threads on housekeeping.
 
 ---
 
 ## Repository structure
 
 ```
-trade-ops-ansible/
-├── ansible.cfg                  # Ansible defaults: inventory, roles path, become, YAML output
+├── ansible.cfg                    # inventory, roles path, become=sudo, YAML output
 ├── inventory/
-│   └── hosts.yml                # The trading-node target (reached over SSH)
-├── playbooks/
-│   └── site.yml                 # Top-level play: runs all roles in order
+│   ├── hosts.yml                  # trading node via host-only net (from the control VM)
+│   └── local.yml                  # fallback: run the playbook on the node itself
+├── playbooks/site.yml             # runs the 4 roles (tagged: kernel/monitoring/app/bod)
 ├── roles/
-│   ├── kernel-tuning/           # CPU isolation, hugepages, THP off, low-latency sysctls (+ GRUB)
-│   ├── monitoring-agent/        # Netdata install + bind config + Prometheus scrape
-│   ├── trading-app-deploy/      # venv + mock exchange + trading engine + systemd units
-│   └── bod-checks/              # BOD readiness script + config + systemd service & timer
-├── scripts/
-│   └── latency_demo.sh          # tc/netem latency-injection demo helper
-├── README.md
-└── ProjectDeepDive.md          # Full design/ops study guide (read this to understand everything)
+│   ├── kernel-tuning/             # isolcpus/nohz/rcu/hugepages, RT-throttle off, SMT-offline oneshot
+│   ├── monitoring-agent/          # netdata (apt), localhost bind, per-core CPU
+│   ├── trading-app-deploy/        # trader user, CMake build, systemd units (RT/caps/affinity)
+│   │   └── files/cpp/             # ← the C++20 engine + mock exchange (see cpp/README.md)
+│   └── bod-checks/                # readiness script + config + systemd timer
+├── scripts/latency_demo.sh        # tc/netem latency-injection demo
+├── INTERVIEW_NOTES.md             # every C++ topic → file map + talking points
+├── ProjectDeepDive.md             # full design/measurement/war-stories study guide
+└── README.md
 ```
+
+The C++ lives in [`roles/trading-app-deploy/files/cpp/`](roles/trading-app-deploy/files/cpp/)
+— 13 headers + 2 binaries + a microbench; see its
+[README](roles/trading-app-deploy/files/cpp/README.md).
 
 ---
 
-## Prerequisites
+## Quickstart
 
-- A host with hardware virtualization, VirtualBox installed, and (on Windows) Hyper-V / WSL2 **disabled** so VirtualBox gets exclusive VT-x.
-- An Ubuntu Server VM (this build used 4 vCPU / 3 GB RAM / 25 GB disk) with OpenSSH installed.
-- VirtualBox NAT port-forwards: host `2222 → 22` (SSH), `19999 → 19999` (Netdata), optionally `8000 → 8000` (raw metrics).
-
-## How to run
+**Build & run the engine locally** (no isolation needed — pins to whatever cores exist):
 
 ```bash
-# From the repo root on the trading node
-ansible-lint playbooks/ roles/                       # lint (clean at 'production' profile)
-ansible-playbook playbooks/site.yml --check --diff   # dry run — preview every change
-ansible-playbook playbooks/site.yml                  # apply for real
+cd roles/trading-app-deploy/files/cpp
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+./build/mock_exchange --pin=off &
+./build/trading_engine --huge=off --pin=on --rt=off --rate=2000
+curl -s localhost:8000/metrics | grep engine_t2t     # tick-to-trade percentiles
+taskset -c 6 ./build/microbench                        # the A/B numbers
 ```
 
-After the **first** apply (which changes the kernel command line), reboot once so CPU isolation takes effect, then re-run to converge:
+**Full deploy with tuning** (bare metal; needs sudo, reboot once for GRUB isolation):
 
 ```bash
-sudo reboot
-# reconnect, then:
-ansible-playbook playbooks/site.yml
+ansible-playbook -i inventory/local.yml playbooks/site.yml --tags kernel -K   # isolation
+sudo reboot                                                                    # activate isolcpus/hugepages
+ansible-playbook -i inventory/local.yml playbooks/site.yml -K                  # build + deploy + monitor
 ```
 
-## Access points
-
-| Service | Where | Port | Reached via |
-|---|---|---|---|
-| SSH | trading node | 22 | host `127.0.0.1:2222` (NAT forward) |
-| Netdata dashboard | trading node | 19999 | browser `http://127.0.0.1:19999` |
-| Engine metrics | trading node | 8000 | Netdata scrape (loopback); optional host `:8000` |
-| Mock exchange (FIX) | trading node | 9001 | internal loopback only |
+Verify: `cat /proc/cmdline` (isolation params), `lscpu -e` (9/11/13/15 offline),
+`bod_check.sh` (READY), `curl localhost:8000/metrics`, netdata at
+`http://127.0.0.1:19999`.
 
 ---
 
-## Roles
+## Runtime A/B toggles (no rebuild)
 
-| Role | What it does | Key outcomes |
-|---|---|---|
-| `kernel-tuning` | Sets `isolcpus=2 nohz_full=2 rcu_nocbs=2 transparent_hugepage=never` on the GRUB cmdline; applies low-latency sysctls; reserves hugepages; sets governor (bare-metal only); disables irqbalance (if present); pins device IRQs to a computed housekeeping mask (off the isolated core); detects and reports the kernel preemption model. | `/proc/cmdline` shows isolation; 64 hugepages reserved; THP off; device IRQs land on housekeeping cores (e.g. `0xa`). |
-| `monitoring-agent` | Installs Netdata (static build), binds it on all interfaces, configures it to scrape the engine's Prometheus endpoint. | Dashboard on `:19999`, scraping `:8000`. |
-| `trading-app-deploy` | Creates a Python venv, installs `simplefix` + `prometheus-client`, deploys the mock exchange and trading engine, installs their systemd units (engine pinned to CPU 2), tells Netdata to scrape the engine. | Two running services; live T2T metrics. |
-| `bod-checks` | Deploys the BOD readiness script + config; installs a systemd service and a pre-open timer (Mon–Fri 08:45 IST); sets the timezone; ensures chrony. | `bod-check.timer` armed; `bod_check.sh` returns PASS/WARN/FAIL. |
-
----
-
-## The trading application (simulated FIX)
-
-- **Mock Exchange** (`mock_exchange.py`) — a FIX 4.2 **acceptor** listening on `:9001`. Acknowledges Logon and replies to every `NewOrderSingle (35=D)` with a filled `ExecutionReport (35=8)`.
-- **Trading Engine** (`trading_engine.py`) — a FIX 4.2 **initiator**. Logs on, then continuously sends orders from a list of ~300 hardcoded signals, measures the round-trip **tick-to-trade** latency (signal → execution report), and exposes it as Prometheus metrics.
-
-> **Note on ITCH/OUCH:** those are Nasdaq protocols, not NSE/BSE, so this project uses a vendor-neutral generic **FIX** session to demonstrate stack literacy. India's venues use NSE's NNF interface and TBT/MTBT market-data feeds — covered in the deep-dive.
-
-## Metrics exposed by the engine (`:8000/metrics`)
-
-| Metric | Type | Meaning |
-|---|---|---|
-| `engine_tick_to_trade_seconds` | Histogram | T2T latency distribution (buckets → p50/p95/p99). |
-| `engine_t2t_microseconds` | Gauge | Most recent T2T sample, in µs (a clean dashboard line). |
-| `engine_orders_total` | Counter | Orders sent (rate = orders/sec). |
-| `engine_fills_total` | Counter | Execution reports received. |
-
-The dashboard shows these alongside system metrics: **per-core CPU** (including the isolated cpu2), **context switches**, **interrupts**, **network throughput/errors**, **memory**, and **disk**.
+| flag | effect |
+|---|---|
+| `--dispatch=crtp\|virtual` | strategy call: inlined CRTP vs vtable |
+| `--alloc=pool\|malloc` | per-order scratch: object pool vs `operator new` |
+| `--huge=on\|off` | hot state on 2 MB huge pages vs regular heap |
+| `--pin=on\|off` `--rt=on\|off` | affinity + `SCHED_FIFO` |
+| `--rate=N` | synthetic ticks/sec |
 
 ---
 
 ## The two live demos
 
-- **Latency injection** — `sudo ./scripts/latency_demo.sh on` injects `5ms ± 1ms` of `netem` delay on the loopback interface; T2T jumps from ~1.2 ms to ~11 ms live on the dashboard; `off` restores it. Demonstrates latency troubleshooting / bottleneck identification.
-- **Failover / self-heal** — `sudo systemctl kill -s SIGKILL trading-engine` → `Restart=on-failure` brings it back in ~2 s (HA). A clean `systemctl stop` instead leaves it down, so a BOD run returns **NOT READY (exit 2)**, demonstrating the readiness gate.
+- **Latency injection** — `sudo ./scripts/latency_demo.sh on` adds `netem`
+  delay on loopback; `rtt` on the dashboard jumps ~10 ms (`t2t`, the engine
+  path, is unaffected — the point). `off` restores baseline.
+- **Failover / self-heal** — `sudo systemctl kill -s SIGKILL trading-engine` →
+  systemd restarts it in ~2 s; a clean `systemctl stop` leaves it down and
+  `bod_check.sh` returns **NOT READY (exit 2)** — the readiness gate.
 
 ---
 
-## Mapping to the Trade Operations Engineer role
+## Engine metrics (`:8000/metrics`)
 
-| JD responsibility | Where it lives in this project |
+`engine_t2t_{p50,p99,p999,max,mean}_ns` (**engine tick-to-trade** — the number we
+optimise), `engine_rtt_{…}_ns` (round trip incl. exchange), `engine_orders_total`
+/ `engine_fills_total` (counters), `engine_tsc_ghz`, `engine_hugepages`. Standard
+Prometheus text — plugs into Prometheus+Grafana unchanged.
+
+---
+
+## Mapping to the role
+
+| Responsibility | Evidence |
 |---|---|
-| Manage/optimize low-latency infrastructure | `kernel-tuning` role + isolated-core engine |
-| Automation with Ansible | Entire repo: roles, inventory, handlers, `--check`, lint |
-| Python & Bash ops scripts | `trading_engine.py`, `mock_exchange.py`, `bod_check.sh`, `latency_demo.sh` |
-| Linux kernel parameter tuning | `kernel-tuning` role (CPU/memory/network) |
-| Daily system / BOD checks before open | `bod-checks` role + `bod-check.timer` |
-| Monitor trading systems / raise alerts | Netdata + tick-to-trade metrics + BOD exit codes |
-| Troubleshoot network/system latency | `tc/netem` demo + per-core/IRQ dashboards |
-| High availability / minimal downtime | `Restart=on-failure` systemd self-heal demo |
+| **C++ (core skill)** | 13-header lock-free C++20 engine: SPSC rings, HDR histogram, object pool / arena / huge-page arena, CRTP-vs-virtual, hand-rolled FIX, `pthread` affinity + `SCHED_FIFO` |
+| Low-latency infra | isolcpus/nohz_full/rcu_nocbs, explicit hugepages, RT-throttle disabled, SMT-offline, performance governor, per-core pinning |
+| Automation (Ansible) | 4 idempotent roles, two inventories, tags, `--check`/`--diff`, handlers |
+| Kernel tuning | full boot + sysctl knob set, applied and verified |
+| BOD checks | readiness role + timer; 15-pass gate incl. isolation/TSC/hugepages-in-use |
+| Monitoring & alerting | netdata per-core + engine `:8000/metrics`; BOD exit codes |
+| Latency troubleshooting | `perf`/`strace`/microbench methodology; documented war stories |
+| High availability | `Restart=on-failure` self-heal |
+| Python & Bash | Ansible + `bod_check.sh` / `latency_demo.sh` / `trade-ops-cpu-tuning.sh` |
 
 ---
 
 ## Honest limitations
 
-- **VM, not bare metal.** Latency numbers reflect host-scheduler jitter, not silicon determinism. Real validation requires bare metal with pinned cores, BIOS C-states/turbo disabled, a PREEMPT_RT or tickless kernel, and a 24-hour `cyclictest` under load.
-- **CPU governor** isn't exposed inside the VM, so that tuning is skipped (and clearly noted) — it's a BIOS/bare-metal step.
-- **IRQ pinning is best-effort and honestly reported.** `smp_affinity` is a *request* the kernel intersects with what each IRQ allows; the role reports the *effective* mask it reads back, not the requested one (on this VM `0xb` settled to `0xa`). **PREEMPT_RT** is detected and reported, not installed — that's a separate kernel build, out of scope. Together with the governor and irqbalance skips, these are four honest "I know the bare-metal step; here's what the VM allows" demonstrations.
-- **Control and managed node are co-located** on one VM for resource reasons. The Ansible roles, inventory, SSH transport, and idempotency are identical to managing remote colocation servers; in production you simply point the inventory at the colo hosts.
+- **Loopback TCP, not a real NIC** — no kernel bypass (ef_vi/DPDK/AF_XDP); the
+  `t2t`↔`rtt` gap *is* the kernel-stack cost. The `rtt` number includes the mock
+  exchange, which you'd never own in production; the engine's own number is `t2t`.
+- **Single socket** — no real NUMA. **Not PREEMPT_RT** (kernel is
+  PREEMPT_DYNAMIC). **Netdata (apt) lacks the go.d plugin**, so engine metrics
+  are read from `:8000` directly; the per-core CPU dashboard works.
+- The mock exchange doesn't enforce FIX sequence numbers or risk checks.
+
+Production adds: real NIC IRQ affinity, kernel bypass, PREEMPT_RT/tickless,
+NUMA-aware placement, PTP time sync, redundant paths + sub-ms failover.
+
+---
 
 ## Tech stack
 
-Ubuntu Server · Ansible / ansible-lint · Netdata · Python 3 (`simplefix`, `prometheus-client`) · systemd · chrony · `tc/netem` · `rt-tests` (`cyclictest`) · VirtualBox · Git/GitHub.
+C++20 (GCC, CMake) · Ansible · Netdata · systemd · chrony · `tc/netem` ·
+`perf`/`strace` · Linux CPU isolation · VirtualBox (control-node VM) · Git.
 
-**For the full reasoning behind every decision, a line-by-line explanation of the FIX scripts, a complete data-flow map, and an FAQ, see [`ProjectDeepDive.md`](./ProjectDeepDive.md).**
+**For the full design, the complete rdtsc/metrics methodology, the A/B data, and
+the debugging war stories, read [`ProjectDeepDive.md`](ProjectDeepDive.md). For
+the interview-topic → file map, see [`INTERVIEW_NOTES.md`](INTERVIEW_NOTES.md).**

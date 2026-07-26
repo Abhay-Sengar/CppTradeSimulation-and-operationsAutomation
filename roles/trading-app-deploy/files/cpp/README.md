@@ -8,7 +8,8 @@ topic→file map.
 market-data (cpu8) --ring1--> strategy (cpu10) --ring2--> gateway (cpu12)
                                                               |  FIX/TCP
      rdtsc t0 rides the whole pipeline                        v  loopback:9001
-     +----------------- tick_to_trade ------------------> exchange (cpu14)
+     +------------------ round trip (rtt) --------------> exchange (cpu14)
+     (t2t = engine-only: t0 -> gateway about to send; rtt = t0 -> fill back)
 
 gateway --ring3--> logger (housekeeping)     metrics-http :8000 (housekeeping)
 ```
@@ -71,8 +72,9 @@ Under systemd (via the Ansible role) the flags come from
 ## Microbench (clean per-op numbers)
 
 ```bash
-taskset -c 10 ./build/microbench
-# dispatch crtp vs virtual   ~0.68 vs 1.36 ns   (2.0x)
-# alloc    pool vs malloc    ~4.4  vs 17.7 ns   (4.0x)
-# map      flat vs unordered ~1.4  vs 2.4  ns   (1.7x)
+# run on a FREE core (not one already running a busy FIFO hot thread)
+taskset -c 6 ./build/microbench
+# dispatch crtp vs virtual   0.46 vs 0.94 ns   (2.06x)
+# alloc    pool vs malloc    2.88 vs 12.58 ns  (4.36x)
+# map      flat vs unordered 1.02 vs 1.67 ns   (1.64x)
 ```

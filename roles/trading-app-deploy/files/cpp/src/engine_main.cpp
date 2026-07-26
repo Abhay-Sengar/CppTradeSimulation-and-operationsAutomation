@@ -4,15 +4,19 @@
 //   market-data (cpu 8) --ring1--> strategy (cpu 10) --ring2--> gateway (cpu 12)
 //        |                                                          |  FIX/TCP
 //        | rdtsc t0 rides the whole way                            v  loopback
-//        +------------------ tick-to-trade ------------------> exchange (cpu 14)
+//        +---------------- round trip (rtt) -----------------> exchange (cpu 14)
 //
 //   gateway --ring3--> logger (housekeeping)      metrics-http (housekeeping)
 //
 // Two latencies are measured (both start at the market-data rdtsc stamp):
-//   * pipeline      : tick -> gateway about to send  (in-process, sub-us; this
-//                     is where the CRTP/alloc/huge A/B deltas are visible)
-//   * tick_to_trade : tick -> ExecutionReport in      (full, dominated by the
-//                     loopback TCP round trip — the kernel-bypass motivation)
+//   * t2t (tick-to-trade) : tick generated -> order encoded & ready to send.
+//                     100% INSIDE the engine (the part we control/optimise);
+//                     this is the real tick-to-trade and where the CRTP/alloc/
+//                     huge A/B deltas are visible (sub-microsecond).
+//   * rtt (round trip)    : tick -> ExecutionReport received back. Includes the
+//                     mock exchange + two trips through the kernel TCP stack, so
+//                     it is NOT engine-only — it shows the kernel/network cost
+//                     that kernel bypass removes.
 //
 // Runtime flags (no rebuild needed for the demo):
 //   --dispatch=crtp|virtual   --alloc=pool|malloc   --huge=on|off
@@ -90,8 +94,8 @@ struct HotState {
     SpscRing<Tick, ring_capacity()>      ring1;  // md -> strategy
     SpscRing<Order, ring_capacity()>     ring2;  // strategy -> gateway
     SpscRing<LogEvent, ring_capacity()>  ring3;  // gateway -> logger
-    Histogram pipeline;
-    Histogram t2t;
+    Histogram t2t;   // engine tick-to-trade: tick -> order ready to send
+    Histogram rtt;   // round trip: tick -> ExecutionReport in (incl. exchange+net)
     ObjectPool<OrderCtx, 4096> pool;
     u64 pending[pending_capacity()];             // clordid & MASK -> t0_tsc
     std::atomic<u64> orders{0};
@@ -196,9 +200,9 @@ void run_gateway(HotState& hs, const Cfg& c, const TscClock& clk, int fd) {
         Order o;
         if (hs.ring2.try_pop(o)) {
             did_work = true;
-            const u64 pdt = rdtsc_fast() - o.t0_tsc;            // tick -> send
+            const u64 pdt = rdtsc_fast() - o.t0_tsc;            // tick -> order ready
             if (hs.orders.load(std::memory_order_relaxed) >= warmup)
-                hs.pipeline.record(clk.ticks_to_ns(pdt));
+                hs.t2t.record(clk.ticks_to_ns(pdt));            // engine tick-to-trade
             hs.pending[o.clordid & kPendingMask] = o.t0_tsc;
             (void)net::send_all(fd, o.fix, o.fix_len);
             hs.orders.fetch_add(1, std::memory_order_relaxed);
@@ -219,9 +223,9 @@ void run_gateway(HotState& hs, const Cfg& c, const TscClock& clk, int fd) {
                 if (v.get(35) == "8") {                        // ExecutionReport
                     const u64 id = static_cast<u64>(v.get_int(11));
                     const u64 t0 = hs.pending[id & kPendingMask];
-                    const u64 dt = clk.ticks_to_ns(rdtsc_fast() - t0);  // tick -> ER
+                    const u64 dt = clk.ticks_to_ns(rdtsc_fast() - t0);  // tick -> fill
                     if (hs.fills.load(std::memory_order_relaxed) >= warmup)
-                        hs.t2t.record(dt);
+                        hs.rtt.record(dt);                              // round trip
                     hs.fills.fetch_add(1, std::memory_order_relaxed);
                 }
             }
@@ -262,8 +266,8 @@ void append_gauge(std::string& s, const char* name, u64 v) {
 }
 
 std::string build_metrics(const HotState& hs, const TscClock& clk, bool on_huge) {
-    const Histogram::Snapshot p = hs.pipeline.snapshot();
-    const Histogram::Snapshot q = hs.t2t.snapshot();
+    const Histogram::Snapshot p = hs.t2t.snapshot();   // engine tick-to-trade
+    const Histogram::Snapshot q = hs.rtt.snapshot();   // round trip (incl. exchange)
     std::string s;
     s.reserve(1024);
     char line[128];
@@ -273,16 +277,18 @@ std::string build_metrics(const HotState& hs, const TscClock& clk, bool on_huge)
                           static_cast<unsigned long long>(hs.orders.load(std::memory_order_relaxed)),
                           static_cast<unsigned long long>(hs.fills.load(std::memory_order_relaxed)));
     s.append(line, static_cast<std::size_t>(n));
-    append_gauge(s, "engine_pipeline_p50_ns", p.p50);
-    append_gauge(s, "engine_pipeline_p99_ns", p.p99);
-    append_gauge(s, "engine_pipeline_p999_ns", p.p999);
-    append_gauge(s, "engine_pipeline_max_ns", p.max);
-    append_gauge(s, "engine_pipeline_mean_ns", p.mean);
-    append_gauge(s, "engine_tick_to_trade_p50_ns", q.p50);
-    append_gauge(s, "engine_tick_to_trade_p99_ns", q.p99);
-    append_gauge(s, "engine_tick_to_trade_p999_ns", q.p999);
-    append_gauge(s, "engine_tick_to_trade_max_ns", q.max);
-    append_gauge(s, "engine_tick_to_trade_mean_ns", q.mean);
+    // t2t = engine tick-to-trade (tick -> order ready). The metric we optimise.
+    append_gauge(s, "engine_t2t_p50_ns", p.p50);
+    append_gauge(s, "engine_t2t_p99_ns", p.p99);
+    append_gauge(s, "engine_t2t_p999_ns", p.p999);
+    append_gauge(s, "engine_t2t_max_ns", p.max);
+    append_gauge(s, "engine_t2t_mean_ns", p.mean);
+    // rtt = round trip tick -> fill (includes the mock exchange + kernel TCP).
+    append_gauge(s, "engine_rtt_p50_ns", q.p50);
+    append_gauge(s, "engine_rtt_p99_ns", q.p99);
+    append_gauge(s, "engine_rtt_p999_ns", q.p999);
+    append_gauge(s, "engine_rtt_max_ns", q.max);
+    append_gauge(s, "engine_rtt_mean_ns", q.mean);
     n = std::snprintf(line, sizeof(line),
                       "# TYPE engine_tsc_ghz gauge\nengine_tsc_ghz %.3f\n"
                       "# TYPE engine_hugepages gauge\nengine_hugepages %d\n",

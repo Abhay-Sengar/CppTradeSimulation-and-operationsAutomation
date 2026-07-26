@@ -21,15 +21,18 @@ governor, RT throttling disabled — microbench min ns/op):
 | alloc: pool vs malloc | 2.88 ns | 12.58 ns | 4.36× |
 | map: flat vs `unordered_map` | 1.02 ns | 1.67 ns | 1.64× |
 
-Live pipeline latency on the isolated cores (from `:8000/metrics`):
+Live latency on the isolated cores (from `:8000/metrics`). **`t2t` is the
+engine-only number we optimise** (tick generated → order ready to send, fully
+in-process); **`rtt` includes the mock exchange + kernel TCP** and is NOT
+engine-only:
 
 | histogram | p50 | p99 | p999 | max |
 |---|---|---|---|---|
-| `pipeline` (in-process, md→gateway) | 588 ns | 1.58 µs | 2.0 µs | 2.5 µs |
-| `tick_to_trade` (full TCP round trip) | 43 µs | 59 µs | 67 µs | — |
+| `t2t` — engine tick-to-trade (md→gateway) | 588 ns | 1.58 µs | 2.0 µs | 2.5 µs |
+| `rtt` — round trip incl. exchange (md→fill) | 43 µs | 59 µs | 67 µs | — |
 
-The ~0.6µs pipeline vs ~43µs tick-to-trade gap is the kernel/TCP stack cost —
-the live motivation for kernel bypass. Getting the pipeline tail down to ~2µs
+The ~0.6µs `t2t` vs ~43µs `rtt` gap is the kernel/TCP stack cost —
+the live motivation for kernel bypass. Getting the `t2t` tail down to ~2µs
 required: isolcpus + nohz_full + SCHED_FIFO **with RT throttling disabled**
 (`kernel.sched_rt_runtime_us=-1`) so the pinned FIFO thread is never stalled,
 and keeping the non-hot threads (logger/metrics) on housekeeping cores. Before
@@ -126,7 +129,7 @@ lesson in why each knob matters.
 |---|---|---|
 | `TCP_NODELAY`, `SO_BUSY_POLL`, socket buffers | ✅ | `net.hpp`. NODELAY disables Nagle (don't buffer a small order); SO_BUSY_POLL busy-polls the NIC queue; buffers tuned via sysctl in kernel-tuning. |
 | UDP multicast, IGMP join | 📖 | Exchanges fan out market data via UDP multicast; receivers `IP_ADD_MEMBERSHIP` (IGMP join). Our transport is TCP-loopback FIX, so this is concept-only. |
-| Kernel bypass: ExaNIC / Solarflare ef_vi | 📖 | Map NIC RX/TX rings into user space, poll in userland → skip the kernel network stack and its syscall/copy/IRQ overhead. Our `tick_to_trade` vs `pipeline` gap (~24µs vs ~0.8µs) is precisely the kernel cost this removes. |
+| Kernel bypass: ExaNIC / Solarflare ef_vi | 📖 | Map NIC RX/TX rings into user space, poll in userland → skip the kernel network stack and its syscall/copy/IRQ overhead. Our `rtt` vs `t2t` gap (~43µs vs ~0.6µs) is precisely the kernel cost this removes. |
 
 ## Build & Tooling
 
