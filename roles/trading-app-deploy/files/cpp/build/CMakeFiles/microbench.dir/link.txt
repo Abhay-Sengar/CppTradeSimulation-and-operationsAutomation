@@ -1,1 +1,0 @@
-/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/microbench.dir/bench/microbench.cpp.o -o microbench  -lpthread 

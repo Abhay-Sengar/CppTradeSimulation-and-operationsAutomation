@@ -1,0 +1,14 @@
+# C++ build artifacts
+roles/trading-app-deploy/files/cpp/build/
+build/
+*.o
+*.obj
+
+# Ansible
+*.retry
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

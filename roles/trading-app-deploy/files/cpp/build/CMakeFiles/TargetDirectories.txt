@@ -1,5 +1,0 @@
-/home/abhayps/Desktop/HFT/CppTradeSimulation-and-operationsAutomation/roles/trading-app-deploy/files/cpp/build/CMakeFiles/trading_engine.dir
-/home/abhayps/Desktop/HFT/CppTradeSimulation-and-operationsAutomation/roles/trading-app-deploy/files/cpp/build/CMakeFiles/mock_exchange.dir
-/home/abhayps/Desktop/HFT/CppTradeSimulation-and-operationsAutomation/roles/trading-app-deploy/files/cpp/build/CMakeFiles/microbench.dir
-/home/abhayps/Desktop/HFT/CppTradeSimulation-and-operationsAutomation/roles/trading-app-deploy/files/cpp/build/CMakeFiles/edit_cache.dir
-/home/abhayps/Desktop/HFT/CppTradeSimulation-and-operationsAutomation/roles/trading-app-deploy/files/cpp/build/CMakeFiles/rebuild_cache.dir
