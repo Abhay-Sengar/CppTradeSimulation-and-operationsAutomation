@@ -19,9 +19,16 @@ DISABLE_TURBO="${DISABLE_TURBO:-0}"
 echo "[trade-ops-cpu] offlining SMT siblings: ${OFFLINE_SIBLINGS}"
 for c in $OFFLINE_SIBLINGS; do
   f="/sys/devices/system/cpu/cpu${c}/online"
-  if [ -w "$f" ]; then
-    echo 0 > "$f" && echo "  cpu${c} -> offline"
-  fi
+  [ -w "$f" ] || continue
+  # Retry: at boot the write can transiently return EBUSY while the scheduler
+  # migrates kernel threads off the core. Give it a few tries before giving up.
+  for attempt in 1 2 3 4 5; do
+    if echo 0 > "$f" 2>/dev/null; then
+      echo "  cpu${c} -> offline"
+      break
+    fi
+    [ "$attempt" = 5 ] && echo "  cpu${c} -> STILL BUSY after 5 tries" || sleep 0.5
+  done
 done
 
 echo "[trade-ops-cpu] setting governor: ${GOVERNOR}"

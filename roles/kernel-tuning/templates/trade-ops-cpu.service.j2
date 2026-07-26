@@ -1,10 +1,11 @@
 {{ ansible_managed | comment }}
 [Unit]
 Description=Trade-Ops CPU tuning (offline SMT siblings, performance governor)
-# Run after the CPUs and cpufreq are up. RemainAfterExit keeps the unit "active"
-# so its state is visible in systemctl and it is easy to disable to revert.
-After=sysinit.target
-DefaultDependencies=no
+# Run LATE (default deps => after basic.target, as part of multi-user). At early
+# boot (sysinit) a CPU offline write can return EBUSY while the scheduler is
+# still migrating kernel threads off it; by multi-user the write succeeds. The
+# script also retries, so this is belt-and-suspenders.
+After=basic.target
 
 [Service]
 Type=oneshot
