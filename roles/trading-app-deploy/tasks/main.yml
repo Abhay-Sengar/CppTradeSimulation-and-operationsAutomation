@@ -1,45 +1,61 @@
 ---
-- name: Install Python venv support
+- name: Install the C++ build toolchain
   ansible.builtin.apt:
     name:
-      - python3-venv
-      - python3-pip
+      - build-essential
+      - cmake
     state: present
     update_cache: false
 
-- name: Create the app directory
+- name: Create the trading service user
+  ansible.builtin.user:
+    name: "{{ trading_app_user }}"
+    system: true
+    shell: /usr/sbin/nologin
+    create_home: false
+
+- name: Create the app and source directories
   ansible.builtin.file:
-    path: "{{ trading_app_dir }}"
+    path: "{{ item }}"
     state: directory
     mode: "0755"
+  loop:
+    - "{{ trading_app_dir }}"
+    - "{{ trading_app_dir }}/bin"
+    - "{{ trading_src_dir }}"
 
-- name: Create the virtualenv
+- name: Sync the C++ sources to the node
+  ansible.builtin.copy:
+    src: cpp/
+    dest: "{{ trading_src_dir }}/"
+    mode: preserve
+  register: trading_src_sync
+
+- name: Configure the C++ build (CMake, Release)
   ansible.builtin.command:
-    cmd: "python3 -m venv {{ trading_venv }}"
-    creates: "{{ trading_venv }}/bin/python"
+    cmd: cmake -S {{ trading_src_dir }} -B {{ trading_src_dir }}/build -DCMAKE_BUILD_TYPE=Release
+    creates: "{{ trading_src_dir }}/build/CMakeCache.txt"
 
-- name: Install FIX + metrics libraries into the venv
-  ansible.builtin.pip:
-    name:
-      - simplefix
-      - prometheus-client
-    virtualenv: "{{ trading_venv }}"
+- name: Compile the trading engine and mock exchange
+  ansible.builtin.command:
+    cmd: cmake --build {{ trading_src_dir }}/build -j
+  register: trading_build
+  changed_when: "'Built target' in trading_build.stdout"
 
-- name: Deploy mock exchange
+- name: Install the built binaries
   ansible.builtin.copy:
-    src: mock_exchange.py
-    dest: "{{ trading_app_dir }}/mock_exchange.py"
+    src: "{{ trading_src_dir }}/build/{{ item }}"
+    dest: "{{ trading_app_dir }}/bin/{{ item }}"
     mode: "0755"
-  notify: Restart mock exchange
+    remote_src: true
+  loop:
+    - trading_engine
+    - mock_exchange
+  notify:
+    - Restart mock exchange
+    - Restart trading engine
 
-- name: Deploy trading engine
-  ansible.builtin.copy:
-    src: trading_engine.py
-    dest: "{{ trading_app_dir }}/trading_engine.py"
-    mode: "0755"
-  notify: Restart trading engine
-
-- name: Own the app tree as the app user
+- name: Own the app tree as the service user
   ansible.builtin.file:
     path: /opt/trade-ops
     state: directory
@@ -67,7 +83,7 @@
 
 - name: Ensure Netdata go.d directory exists
   ansible.builtin.file:
-    path: /opt/netdata/etc/netdata/go.d
+    path: /etc/netdata/go.d
     state: directory
     mode: "0755"
 
@@ -77,7 +93,7 @@
       jobs:
         - name: trading_engine
           url: http://127.0.0.1:{{ trading_metrics_port }}/metrics
-    dest: /opt/netdata/etc/netdata/go.d/prometheus.conf
+    dest: /etc/netdata/go.d/prometheus.conf
     mode: "0644"
   notify: Restart netdata
 

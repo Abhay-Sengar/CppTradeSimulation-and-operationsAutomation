@@ -6,5 +6,7 @@
 - name: Reboot required
   ansible.builtin.debug:
     msg: >-
-      GRUB cmdline changed. Because the control node is co-located on this VM,
-      reboot it manually: 'sudo reboot', reconnect, then verify /proc/cmdline.
+      GRUB cmdline and/or /etc/systemd/system.conf changed on the trading node.
+      Reboot the trading node ('sudo reboot') to activate isolcpus / nohz_full /
+      hugepages / global CPUAffinity, then verify with /proc/cmdline and
+      'lscpu -e'. The control node (Alpine VM) does not need rebooting.

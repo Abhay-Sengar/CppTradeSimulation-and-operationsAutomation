@@ -1,0 +1,5 @@
+# Managed by Ansible (kernel-tuning role) — do not edit by hand.
+# Consumed by /usr/local/sbin/trade-ops-cpu-tuning.sh at boot.
+OFFLINE_SIBLINGS="{{ kernel_tuning_offline_siblings | join(' ') }}"
+GOVERNOR="{{ kernel_tuning_governor }}"
+DISABLE_TURBO="{{ '1' if kernel_tuning_disable_turbo else '0' }}"

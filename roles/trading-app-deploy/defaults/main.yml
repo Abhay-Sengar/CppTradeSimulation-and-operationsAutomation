@@ -1,8 +1,26 @@
 ---
 trading_app_dir: /opt/trade-ops/app
-trading_venv: /opt/trade-ops/venv
+trading_src_dir: /opt/trade-ops/src
 trading_app_user: trader
 trading_metrics_port: 8000
 trading_exchange_port: 9001
-# Pin the engine to the isolated core from the kernel-tuning role
-trading_engine_cpu: "{{ kernel_tuning_isolated_cpus | default('2') }}"
+
+# One hot thread pinned per physical isolated core (siblings offline).
+trading_md_cpu: 8
+trading_strategy_cpu: 10
+trading_gateway_cpu: 12
+trading_exchange_cpu: 14
+trading_rt_prio: 80
+# Housekeeping cores for the process's NON-hot threads (logger, metrics-http,
+# main). The unit affinity must include these AND the isolated cores: the hot
+# threads pin themselves to the isolated cores, while isolcpus keeps the
+# unpinned threads on housekeeping. Without 0-7 here, the non-hot threads get
+# trapped on the isolated cores and wreck the tail latency.
+trading_housekeeping_cpus: "0-7"
+
+# Runtime engine A/B toggles — the systemd unit passes these; flip them for the
+# demo (no rebuild needed). dispatch: crtp|virtual, alloc: pool|malloc, huge: on|off.
+trading_dispatch: crtp
+trading_alloc: pool
+trading_huge: "on"
+trading_rate: 2000        # synthetic ticks per second

@@ -11,7 +11,8 @@ CLOCK_OFFSET_MAX_MS="${CLOCK_OFFSET_MAX_MS:-50}"
 EXCHANGE_HOST="${EXCHANGE_HOST:-127.0.0.1}"
 EXCHANGE_PORT="${EXCHANGE_PORT:-9001}"
 SERVICES="${SERVICES:-ssh}"
-ISOLATED_CPUS="${ISOLATED_CPUS:-2}"
+ISOLATED_CPUS="${ISOLATED_CPUS:-8-15}"
+OFFLINE_SIBLINGS="${OFFLINE_SIBLINGS:-9 11 13 15}"
 
 PASS=0; WARN=0; FAIL=0
 RESULTS=()
@@ -69,9 +70,46 @@ check_isolation() {
 }
 
 check_hugepages() {
-  local t; t=$(awk '/HugePages_Total/ {print $2}' /proc/meminfo)
-  if [ "${t:-0}" -gt 0 ]; then record PASS "Hugepages reserved: ${t}"
-  else record WARN "No hugepages reserved"; fi
+  local t f
+  t=$(awk '/HugePages_Total/ {print $2}' /proc/meminfo)
+  f=$(awk '/HugePages_Free/  {print $2}' /proc/meminfo)
+  if [ "${t:-0}" -gt 0 ]; then
+    # Free < Total means the engine has actually mapped its arena onto huge
+    # pages — the visible proof that MAP_HUGETLB is in use, not just reserved.
+    if [ "${f:-0}" -lt "${t:-0}" ]; then
+      record PASS "Hugepages reserved ${t}, in use $((t - f)) (engine mapped its arena)"
+    else
+      record WARN "Hugepages reserved ${t} but none in use (engine not running on huge pages)"
+    fi
+  else
+    record WARN "No hugepages reserved"
+  fi
+}
+
+check_tsc() {
+  local flags c n
+  flags=$(grep -m1 '^flags' /proc/cpuinfo)
+  c=$(echo "$flags" | grep -c constant_tsc)
+  n=$(echo "$flags" | grep -c nonstop_tsc)
+  if [ "$c" -ge 1 ] && [ "$n" -ge 1 ]; then
+    record PASS "Invariant TSC (constant_tsc + nonstop_tsc) — cross-core rdtsc valid"
+  else
+    record WARN "TSC not fully invariant (constant_tsc=$c nonstop_tsc=$n)"
+  fi
+}
+
+check_smt_siblings() {
+  local off=0 total=0 c st
+  for c in $OFFLINE_SIBLINGS; do
+    total=$((total + 1))
+    st=$(cat "/sys/devices/system/cpu/cpu${c}/online" 2>/dev/null)
+    [ "$st" = "0" ] && off=$((off + 1))
+  done
+  if [ "$off" -eq "$total" ] && [ "$total" -gt 0 ]; then
+    record PASS "SMT siblings offline (${OFFLINE_SIBLINGS}) — each hot core is dedicated"
+  else
+    record WARN "SMT siblings not all offline: ${off}/${total} (${OFFLINE_SIBLINGS})"
+  fi
 }
 
 check_thp() {
@@ -121,8 +159,9 @@ check_exchange() {
 }
 
 echo "=== Beginning-of-Day checks  $(date '+%Y-%m-%d %H:%M:%S %Z') ==="
-check_disk; check_memory; check_clock; check_isolation; check_hugepages
-check_thp; check_governor; check_nic; check_services; check_exchange
+check_disk; check_memory; check_clock; check_isolation; check_smt_siblings
+check_tsc; check_hugepages; check_thp; check_governor; check_nic
+check_services; check_exchange
 
 echo
 printf '%s\n' "${RESULTS[@]}" | column -t -s '|' | \

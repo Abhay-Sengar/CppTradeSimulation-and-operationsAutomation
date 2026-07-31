@@ -11,4 +11,5 @@ bod_checks_services:
   - netdata
   - mock-exchange
   - trading-engine
-bod_checks_isolated_cpus: "{{ kernel_tuning_isolated_cpus | default('2') }}"
+bod_checks_isolated_cpus: "{{ kernel_tuning_isolated_cpus | default('8-15') }}"
+bod_checks_offline_siblings: "{{ kernel_tuning_offline_siblings | default([9, 11, 13, 15]) | join(' ') }}"

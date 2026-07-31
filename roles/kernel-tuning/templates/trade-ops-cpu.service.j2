@@ -1,0 +1,16 @@
+{{ ansible_managed | comment }}
+[Unit]
+Description=Trade-Ops CPU tuning (offline SMT siblings, performance governor)
+# Run LATE (default deps => after basic.target, as part of multi-user). At early
+# boot (sysinit) a CPU offline write can return EBUSY while the scheduler is
+# still migrating kernel threads off it; by multi-user the write succeeds. The
+# script also retries, so this is belt-and-suspenders.
+After=basic.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/trade-ops-cpu-tuning.sh
+
+[Install]
+WantedBy=multi-user.target
