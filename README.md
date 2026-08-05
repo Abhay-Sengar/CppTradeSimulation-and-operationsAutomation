@@ -43,21 +43,19 @@ live motivation for kernel bypass.
 │  Housekeeping cpu 0-7              Isolated cpu 8,10,12,14 (phys cores 4-7) │
 │   ├ OS / systemd / netdata          ├ market-data ─ring1─▶ strategy        │
 │   ├ engine: logger + metrics-http   │      (cpu8)          (cpu10)          │
-│   └ sshd (Ansible target)           │                         │ ring2       │
+│   └ Ansible (control plane)         │                         │ ring2       │
 │                                     │                         ▼             │
 │   SMT siblings 9,11,13,15 OFFLINE   ├ mock-exchange ◀─FIX/TCP─ gateway      │
 │                                     └   (cpu14)     :9001     (cpu12)        │
 │   engine :8000/metrics  ──▶ netdata :19999                                  │
-└────────────────────────────┬──────────────────────────────────────────────┘
-                             │ host-only 192.168.56.x
-                  ┌──────────▼─────────┐
-                  │ ops-node (Alpine VM)│  Ansible control node (optional)
-                  └────────────────────┘
+└────────────────────────────────────────────────────────────────────────────┘
 ```
 
 Four planes: **control** (Ansible), **data** (C++ engine + mock exchange),
 **monitoring** (netdata), **readiness** (BOD checks). One hot thread per isolated
 physical core; SPSC lock-free rings between hops; non-hot threads on housekeeping.
+Ansible runs on the node itself (`inventory/local.yml`), or from any separate
+control host over SSH (`inventory/hosts.yml`).
 
 ### Live core map — what runs on each logical CPU
 
@@ -109,8 +107,8 @@ each hot thread owns a full physical core.
 ```
 ├── ansible.cfg                    # inventory, roles path, become=sudo, YAML output
 ├── inventory/
-│   ├── hosts.yml                  # trading node via host-only net (from the control VM)
-│   └── local.yml                  # fallback: run the playbook on the node itself
+│   ├── local.yml                  # run the playbook on the node itself (default)
+│   └── hosts.yml                  # or from a separate control host over SSH (edit host/user)
 ├── playbooks/site.yml             # runs the 4 roles (tagged: kernel/monitoring/app/bod)
 ├── roles/
 │   ├── kernel-tuning/             # isolcpus/nohz/rcu/hugepages, RT-throttle off, SMT-offline oneshot
@@ -223,7 +221,7 @@ NUMA-aware placement, PTP time sync, redundant paths + sub-ms failover.
 ## Tech stack
 
 C++20 (GCC, CMake) · Ansible · Netdata · systemd · chrony · `tc/netem` ·
-`perf`/`strace` · Linux CPU isolation · VirtualBox (control-node VM) · Git.
+`perf`/`strace` · Linux CPU isolation · Git.
 
 **Docs:** [`RUNBOOK.md`](RUNBOOK.md) — start/stop, dashboard, BOD, self-heal, and
 demos, command-first · [`ProjectDeepDive.md`](ProjectDeepDive.md) — full design,

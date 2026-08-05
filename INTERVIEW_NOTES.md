@@ -99,7 +99,7 @@ lesson in why each knob matters.
 | Topic | State | Where / talking point |
 |---|---|---|
 | `rdtsc` + calibration vs `CLOCK_MONOTONIC_RAW` | ✅ | `tsc.hpp`. TSC counts cycles; calibrate ns/tick against MONOTONIC_RAW (no NTP slew). Invariant TSC → cross-core subtraction valid. |
-| `perf stat`, `perf record`, flamegraphs | 📖 | `perf stat ./trading_engine` for IPC/cache-misses/branch-misses; `perf record`+`perf script`+FlameGraph for a flamegraph. Works on bare metal (couldn't in the old VM). |
+| `perf stat`, `perf record`, flamegraphs | 📖 | `perf stat ./trading_engine` for IPC/cache-misses/branch-misses; `perf record`+`perf script`+FlameGraph for a flamegraph. Works on bare metal with real isolated cores. |
 | HDR histogram vs averages; p99/p99.9 | ✅ | `hist.hpp` — sub-buckets per octave (`__builtin_clzll`), fixed relative error. Mean hides the tail; in trading the tail is the risk. |
 | `strace -c` to prove zero syscalls on hot path | ✅/🟡 | md/strategy stages are syscall-free; the **gateway's TCP send/recv are the only syscalls** — which is exactly the motivation for kernel bypass. Be precise about this. |
 | Benchmark hygiene | ✅ | `microbench.cpp`: warm-up, min-over-trials, `do_not_optimize` barriers, run on isolated core, production flags. |

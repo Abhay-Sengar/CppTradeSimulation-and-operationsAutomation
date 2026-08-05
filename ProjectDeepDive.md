@@ -73,7 +73,7 @@ are the two threads of physical core 4, and so on. 14 GB RAM, invariant TSC
 
 ```
  Housekeeping (cpu 0-7)              Isolated (cpu 8,10,12,14 = phys cores 4-7)
-  ├ OS, systemd, VirtualBox           ├ market-data thread  -> cpu 8
+  ├ OS, systemd, Ansible              ├ market-data thread  -> cpu 8
   ├ engine: logger + metrics-http     ├ strategy thread     -> cpu 10
   ├ netdata, sshd                     ├ gateway thread      -> cpu 12
   └ everything not pinned             └ mock-exchange        -> cpu 14
@@ -430,11 +430,11 @@ four roles in order), **roles** (reusable task bundles), **handlers**
 `--check`/`--diff` dry runs, `become` (sudo).
 
 Two inventories:
-- **`inventory/hosts.yml`** — run from the (planned) Alpine control-node VM,
-  reaching the trading node at `192.168.56.1` over the VirtualBox host-only
-  network. The "real control node manages a separate trading node" story.
-- **`inventory/local.yml`** — fallback: run the *same* playbook directly on the
+- **`inventory/local.yml`** — the default: run the playbook directly on the
   trading node (`ansible_connection=local`). Used throughout bring-up.
+- **`inventory/hosts.yml`** — the *same* playbook from a separate control host
+  over SSH (edit the host/user). Shows the "control node manages a separate
+  trading node" story without any change to the roles.
 
 The four roles (each tagged for staged rollout — `--tags kernel,app,…`):
 
@@ -539,14 +539,14 @@ showing the gate would block a market open.
 
 | # | From | To | Channel | What |
 |---|---|---|---|---|
-| 1 | Ansible control node | trading node | SSH 22 (host-only 192.168.56.x) | config, C++ build, service control |
+| 1 | Ansible (local, or a remote control host) | trading node | local / SSH 22 | config, C++ build, service control |
 | 2 | market-data thread | strategy thread | ring1 (in-process, cpu8→10) | `Tick` |
 | 3 | strategy thread | gateway thread | ring2 (in-process, cpu10→12) | `Order` (+ encoded FIX) |
 | 4 | gateway | mock-exchange | TCP 9001 loopback | FIX NewOrderSingle |
 | 5 | mock-exchange | gateway | TCP 9001 loopback | FIX ExecutionReport |
 | 6 | gateway | logger thread | ring3 (in-process → cpu0-7) | `LogEvent` |
 | 7 | engine metrics-http | (exposes) | HTTP 8000 localhost | Prometheus text (t2t/rtt/counters) |
-| 8 | netdata | engine | HTTP 8000 | scrape (if go.d present) |
+| 8 | netdata (trade-metrics.plugin) | engine | HTTP 8000 | scrape → t2t/rtt/orders charts |
 | 9 | kernel | netdata | /proc,/sys | per-core CPU, IRQs, ctxsw, net, mem |
 | 10 | BOD timer | BOD service | systemd | pre-open readiness run |
 
