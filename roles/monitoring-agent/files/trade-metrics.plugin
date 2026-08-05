@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+# trade-metrics.plugin — a netdata external plugin that charts the C++ engine's
+# Prometheus metrics (:8000/metrics) as native netdata charts. Works on ANY
+# netdata build — it does not need the go.d Prometheus collector (which the
+# Ubuntu package omits). Netdata runs every executable in its plugins.d dir and
+# reads this protocol on stdout: CHART/DIMENSION define charts once, then
+# BEGIN/SET/END feed values each update_every seconds. We flush explicitly so
+# netdata sees each cycle immediately (bash pipes would block-buffer).
+import sys
+import time
+import urllib.request
+
+UPDATE = int(sys.argv[1]) if len(sys.argv) > 1 else 1
+URL = "http://127.0.0.1:8000/metrics"
+
+
+def emit(line):
+    sys.stdout.write(line + "\n")
+
+
+# ---- chart definitions (emitted once) --------------------------------------
+# CHART  type.id  name  title  units  family  context  charttype  priority  update_every
+emit(f"CHART trade.t2t '' 'Engine tick-to-trade (t2t)' 'nanoseconds' latency trade.t2t line 90010 {UPDATE}")
+emit("DIMENSION p50 'p50' absolute 1 1")
+emit("DIMENSION p99 'p99' absolute 1 1")
+emit("DIMENSION p999 'p99.9' absolute 1 1")
+emit(f"CHART trade.rtt '' 'Round trip tick-to-fill (rtt)' 'nanoseconds' latency trade.rtt line 90020 {UPDATE}")
+emit("DIMENSION p50 'p50' absolute 1 1")
+emit("DIMENSION p99 'p99' absolute 1 1")
+emit("DIMENSION p999 'p99.9' absolute 1 1")
+emit(f"CHART trade.orders '' 'Order flow' 'orders/s' flow trade.orders line 90030 {UPDATE}")
+emit("DIMENSION orders 'orders' incremental 1 1")
+emit("DIMENSION fills 'fills' incremental 1 1")
+sys.stdout.flush()
+
+
+def scrape():
+    d = {}
+    try:
+        with urllib.request.urlopen(URL, timeout=1) as r:
+            for line in r.read().decode().splitlines():
+                if line and not line.startswith("#"):
+                    key, _, val = line.partition(" ")
+                    d[key] = val
+    except Exception:
+        pass  # engine down / restarting → emit nothing this cycle
+    return d
+
+
+def val(m, key):
+    # netdata SET wants an integer; the metrics are already integer ns / counts
+    v = m.get(key, "0")
+    return v.split(".")[0] or "0"
+
+
+while True:
+    time.sleep(UPDATE)
+    m = scrape()
+    if not m:
+        continue
+    emit("BEGIN trade.t2t")
+    emit(f"SET p50 = {val(m, 'engine_t2t_p50_ns')}")
+    emit(f"SET p99 = {val(m, 'engine_t2t_p99_ns')}")
+    emit(f"SET p999 = {val(m, 'engine_t2t_p999_ns')}")
+    emit("END")
+    emit("BEGIN trade.rtt")
+    emit(f"SET p50 = {val(m, 'engine_rtt_p50_ns')}")
+    emit(f"SET p99 = {val(m, 'engine_rtt_p99_ns')}")
+    emit(f"SET p999 = {val(m, 'engine_rtt_p999_ns')}")
+    emit("END")
+    emit("BEGIN trade.orders")
+    emit(f"SET orders = {val(m, 'engine_orders_total')}")
+    emit(f"SET fills = {val(m, 'engine_fills_total')}")
+    emit("END")
+    sys.stdout.flush()

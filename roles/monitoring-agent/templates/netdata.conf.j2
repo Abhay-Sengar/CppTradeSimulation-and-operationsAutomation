@@ -1,5 +1,11 @@
 [web]
   bind to = {{ monitoring_netdata_bind }}
+  # The dashboard files ship as root:root. Netdata's default web-files owner/group
+  # security check rejects them ("Access to file is not permitted") once our
+  # minimal netdata.conf drops the packaged defaults — so set them explicitly.
+  web files directory = /usr/share/netdata/web
+  web files owner = root
+  web files group = root
 
 # Per-core CPU utilization is off by default in Netdata; enable it so the four
 # isolated trading cores (8/10/12/14) are each visible as their own chart —

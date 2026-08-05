@@ -18,6 +18,17 @@
     mode: "0644"
   notify: Restart netdata
 
+- name: Install the trade-metrics netdata plugin
+  # A tiny external plugin that scrapes the engine's :8000/metrics and charts
+  # t2t/rtt/orders natively — so the latency shows on the dashboard even though
+  # the Ubuntu netdata package ships no go.d Prometheus collector. Netdata runs
+  # every executable in plugins.d automatically.
+  ansible.builtin.copy:
+    src: trade-metrics.plugin
+    dest: /usr/lib/netdata/plugins.d/trade-metrics.plugin
+    mode: "0755"
+  notify: Restart netdata
+
 - name: Ensure Netdata is running
   ansible.builtin.systemd:
     name: netdata
