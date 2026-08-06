@@ -32,7 +32,7 @@
 
 - name: Keep every systemd-spawned service off the isolated cores by default
   # The trading units override this with their own CPUAffinity; isolcpus also
-  # keeps non-pinned tasks (VirtualBox, etc.) off 8-15. Belt and suspenders.
+  # keeps non-pinned tasks (VirtualBox, etc.) off 8-11. Belt and suspenders.
   ansible.builtin.lineinfile:
     path: /etc/systemd/system.conf
     regexp: '^#?\s*CPUAffinity='
@@ -137,11 +137,19 @@
     var: cmdline_now.stdout
 
 - name: Detect the kernel preemption model (knowledge demonstration only)
+  # Do NOT test with `[ -r ... ]` first: on a Secure Boot machine the kernel runs
+  # in lockdown 'integrity' mode (/sys/kernel/security/lockdown), which denies
+  # debugfs reads even to root. The mode bits say readable, so `[ -r ]` passes,
+  # and then the read itself returns EPERM — which used to abort this task and,
+  # because a failed host is dropped from the play, silently stranded the
+  # `Update grub` handler (the play also sets force_handlers now). Attempt the
+  # read and fall back on failure instead of predicting permission.
   ansible.builtin.shell: |
     set -o pipefail
-    if [ -r /sys/kernel/debug/sched/preempt ]; then
-      cat /sys/kernel/debug/sched/preempt
+    if preempt=$(cat /sys/kernel/debug/sched/preempt 2>/dev/null); then
+      echo "$preempt"
     else
+      echo "debugfs unreadable (Secure Boot lockdown: $(cat /sys/kernel/security/lockdown 2>/dev/null || echo n/a))"
       grep -o 'PREEMPT[_A-Z]*' /proc/version | head -1 || echo "unknown"
     fi
   args:
@@ -149,6 +157,8 @@
   register: kernel_tuning_preempt
   changed_when: false
   check_mode: false
+  # Purely informational — it must never gate a converge.
+  failed_when: false
 
 - name: Report preemption model and the bare-metal real-time path
   ansible.builtin.debug:

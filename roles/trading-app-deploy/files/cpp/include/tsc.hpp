@@ -11,8 +11,21 @@
 //     TSC". constant_tsc => the counter ticks at a fixed rate regardless of
 //     P-state/turbo; nonstop_tsc => it keeps running in deep C-states. Together
 //     they also mean the TSC is synchronised across cores, so subtracting a
-//     tick stamped on cpu8 from one read on cpu12 is valid — which is exactly
+//     tick stamped on cpu8 from one read on cpu10 is valid — which is exactly
 //     what the cross-core tick-to-trade measurement does.
+//   * Hybrid CPUs (this box is an Alder Lake i7-1255U, P-cores + E-cores): the
+//     obvious worry is whether a counter read on an E-core is comparable to one
+//     read on a P-core, since the two run at different clocks. It is — the TSC
+//     is NOT the core clock. It is derived from the shared platform crystal at a
+//     fixed ratio and is common to every core in the package — here the 38.4 MHz
+//     crystal x 68 = 2611.2 MHz, whichever core reads it, while the cores
+//     themselves range over 0.4-4.7 GHz. So one calibration is valid
+//     engine-wide and cross-core deltas stay meaningful even across a P/E
+//     boundary. The core clock varying underneath is exactly what constant_tsc
+//     promises to ignore.
+//     Sanity check on calibrate(): the kernel independently reports
+//     "tsc: Detected 2611.200 MHz TSC" (journalctl -k | grep tsc) and this code
+//     measures 2.611 GHz — agreement to 4 significant figures.
 //   * Serialisation: a bare rdtsc can be reordered by the out-of-order engine.
 //     rdtscp waits for prior instructions; the trailing lfence stops later
 //     instructions hoisting above the read. Used where we need a precise fence;

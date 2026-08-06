@@ -7,7 +7,7 @@ with Beginning-of-Day checks. Built to exercise the HFT C++ and Linux
 low-latency skill set end to end.
 
 > **Honest framing:** the *engine, isolation, measurement, and automation are
-> real and run on bare metal* (AMD Ryzen 7 7730U, isolated cores, invariant TSC,
+> real and run on bare metal* (Intel Core i7-1255U, isolated cores, invariant TSC,
 > explicit huge pages, `SCHED_FIFO`). The transport is loopback TCP (not a real
 > exchange link), so the round-trip number includes the mock exchange + kernel —
 > the number the engine *owns* is the in-process tick-to-trade (`t2t`). See
@@ -18,35 +18,73 @@ low-latency skill set end to end.
 ## Headline numbers (bare metal, isolated cores, `performance` governor)
 
 **Engine tick-to-trade** (`t2t` — tick generated → order ready to send, 100%
-in-process):
+in-process), at 50k ticks/s on the isolated E-cores:
 
 | p50 | p99 | p999 | max |
 |---|---|---|---|
-| **588 ns** | **1.58 µs** | **2.0 µs** | 2.5 µs |
+| **474 ns** | **700 ns** | **2.67 µs** | 20.4 µs |
 
 **Round trip** (`rtt` — tick → fill, includes the mock exchange + kernel TCP):
-p50 43 µs · p99 59 µs · p999 67 µs. The ~70× gap is the kernel/TCP cost — the
-live motivation for kernel bypass.
+p50 10.9 µs · p99 13.5 µs · p999 16.8 µs. The ~23× gap is the kernel/TCP cost —
+the live motivation for kernel bypass.
 
-**Microbenchmark A/B** (why the banned constructs are banned):
+**Microbenchmark A/B** (why the banned constructs are banned) — P-core, quiet box:
 
 | dispatch CRTP vs `virtual` | alloc pool vs `malloc` | map flat vs `unordered_map` |
 |---|---|---|
-| 0.46 → 0.94 ns (**2.06×**) | 2.88 → 12.58 ns (**4.36×**) | 1.02 → 1.67 ns (**1.64×**) |
+| 0.25 → 0.58 ns (**2.32×**) | 1.95 → 10.41 ns (**5.33×**) | 0.75 → 2.24 ns (**2.99×**) |
+
+### Hardware migration: same code, two machines
+
+This project was built on an AMD Ryzen 7 7730U and later moved to a hybrid Intel
+i7-1255U (see [`ProjectDeepDive.md`](ProjectDeepDive.md) §3a). Both columns are
+fully tuned, so the comparison is fair:
+
+| `t2t` | Ryzen 7 7730U (Zen 3) | i7-1255U (isolated E-cores) |
+|---|---|---|
+| p50 | 588 ns | **474 ns** (−19%) |
+| p99 | 1.58 µs | **700 ns** (−56%) |
+| p999 | 2.0 µs | **2.67 µs** (+34%) |
+| max | 2.5 µs | 20.4 µs (worse) |
+
+The median and p99 improved — four hot threads inside one E-core L2 cluster make
+the ring hand-offs cheaper than crossing the Ryzen's cache hierarchy. The **far
+tail regressed**: this is a 15 W laptop part sharing a power and thermal budget,
+where the Ryzen held a 2.5 µs max. Honest summary: *better typical latency, worse
+worst case.*
+
+### What each tuning knob is actually worth
+
+Measured with [`scripts/ab_sweep.sh`](scripts/ab_sweep.sh) — one runtime flag
+flipped per run, no rebuild, 1.5 M orders per variant at 50k ticks/s:
+
+| knob turned off | p99 | max | mean | verdict |
+|---|---|---|---|---|
+| CRTP → `virtual` | +1% | +6% | **0%** | **invisible at engine level** |
+| pool → `malloc` | +27% | +75% | +0.6% | tail only |
+| hugepages off | +29% | +67% | −0.6% | tail only |
+| `SCHED_FIFO` off | +18% | +93% | +1.4% | tail only |
+| **pinning off** | **10×** | **154×** | **7.6×** | **the one that matters** |
+
+Two things this says that the numbers alone don't: the per-op knobs (pool,
+hugepages, FIFO) buy **predictability, not throughput** — they barely move the
+mean and heavily move the max. And CRTP's 0.33 ns win is real in the microbench
+yet unmeasurable in a 470 ns pipeline; it is 0.1% of the path. The instrument has
+to match the question.
 
 ---
 
 ## Architecture
 
 ```
-┌── LAPTOP (bare metal, Ubuntu 22.04) ──────────────────────────────────────┐
-│  Housekeeping cpu 0-7              Isolated cpu 8,10,12,14 (phys cores 4-7) │
+┌── LAPTOP (bare metal, Ubuntu 22.04, Intel i7-1255U hybrid) ────────────────┐
+│  Housekeeping cpu 0,2,4-7          Isolated cpu 8-11 (E-cores, one L2)      │
 │   ├ OS / systemd / netdata          ├ market-data ─ring1─▶ strategy        │
-│   ├ engine: logger + metrics-http   │      (cpu8)          (cpu10)          │
+│   ├ engine: logger + metrics-http   │      (cpu8)          (cpu9)           │
 │   └ Ansible (control plane)         │                         │ ring2       │
 │                                     │                         ▼             │
-│   SMT siblings 9,11,13,15 OFFLINE   ├ mock-exchange ◀─FIX/TCP─ gateway      │
-│                                     └   (cpu14)     :9001     (cpu12)        │
+│   P-core HT siblings 1,3 OFFLINE    ├ mock-exchange ◀─FIX/TCP─ gateway      │
+│                                     └   (cpu11)     :9001     (cpu10)        │
 │   engine :8000/metrics  ──▶ netdata :19999                                  │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -61,7 +99,7 @@ control host over SSH (`inventory/hosts.yml`).
 
 ```mermaid
 flowchart TB
-  subgraph HK["HOUSEKEEPING · cpu 0-7 · SCHED_OTHER"]
+  subgraph HK["HOUSEKEEPING · cpu 0,2 (P-cores) + 4-7 (E-cores) · SCHED_OTHER"]
     direction LR
     os["OS · systemd · sshd"]
     nd["netdata :19999"]
@@ -70,35 +108,39 @@ flowchart TB
     eh["engine: metrics-http :8000"]
     ea["exchange: acceptor"]
   end
-  subgraph ISO["ISOLATED · SCHED_FIFO · nohz_full · one hot thread per core"]
+  subgraph ISO["ISOLATED · E-cores, shared L2 · SCHED_FIFO · nohz_full"]
     direction LR
     c8["cpu 8<br/>market-data"]
-    c10["cpu 10<br/>strategy"]
-    c12["cpu 12<br/>gateway"]
-    c14["cpu 14<br/>mock-exchange<br/>handler"]
+    c9["cpu 9<br/>strategy"]
+    c10["cpu 10<br/>gateway"]
+    c11["cpu 11<br/>mock-exchange<br/>fix-handler"]
   end
-  subgraph OFF["OFFLINE · SMT siblings"]
+  subgraph OFF["OFFLINE · HT siblings of the housekeeping P-cores"]
     direction LR
-    c9["cpu 9"]
-    c11["cpu 11"]
-    c13["cpu 13"]
-    c15["cpu 15"]
+    c1["cpu 1"]
+    c3["cpu 3"]
   end
-  c8 -->|"ring1 · Tick"| c10
-  c10 -->|"ring2 · Order+FIX"| c12
-  c12 -->|"FIX NewOrderSingle · TCP :9001"| c14
-  c14 -->|"ExecutionReport"| c12
-  c12 -->|"ring3 · LogEvent"| el
+  c8 -->|"ring1 · Tick"| c9
+  c9 -->|"ring2 · Order+FIX"| c10
+  c10 -->|"FIX NewOrderSingle · TCP :9001"| c11
+  c11 -->|"ExecutionReport"| c10
+  c10 -->|"ring3 · LogEvent"| el
   eh -->|":8000/metrics"| nd
   classDef off fill:#eee,stroke:#bbb,color:#999,stroke-dasharray:4 3;
-  class c9,c11,c13,c15 off;
+  class c1,c3 off;
   classDef hot fill:#0b7,stroke:#065,color:#fff;
-  class c8,c10,c12,c14 hot;
+  class c8,c9,c10,c11 hot;
 ```
 
-The `t2t` metric covers `cpu8 → cpu10 → cpu12` (in-process, ~0.6 µs); `rtt` adds
-the `cpu12 ⇄ cpu14` loopback FIX hop (~43 µs). Cores 9/11/13/15 are offlined so
-each hot thread owns a full physical core.
+The `t2t` metric covers `cpu8 → cpu9 → cpu10` (in-process); `rtt` adds the
+`cpu10 ⇄ cpu11` loopback FIX hop. All four hot cores are E-cores from the *same
+L2 cluster*, so the ring hand-offs between hops stay L2-local instead of going
+out to L3 — and E-cores have no SMT sibling, so each hot thread owns its core
+outright with nothing to offline. The sibling-offlining step instead targets
+cpu1/cpu3, the HT siblings of the two P-cores that host housekeeping (the
+engine's logger/metrics threads and netdata), so those run on full physical
+cores. `cpu0` stays housekeeping deliberately: it is the boot CPU and
+`nohz_full` must leave a timekeeping CPU alone.
 
 ---
 
@@ -116,7 +158,9 @@ each hot thread owns a full physical core.
 │   ├── trading-app-deploy/        # trader user, CMake build, systemd units (RT/caps/affinity)
 │   │   └── files/cpp/             # ← the C++20 engine + mock exchange (see cpp/README.md)
 │   └── bod-checks/                # readiness script + config + systemd timer
-├── scripts/latency_demo.sh        # tc/netem latency-injection demo
+├── scripts/
+│   ├── latency_demo.sh            # tc/netem latency-injection demo
+│   └── ab_sweep.sh                # per-knob attribution sweep + microbench (see Headline numbers)
 ├── INTERVIEW_NOTES.md             # every C++ topic → file map + talking points
 ├── ProjectDeepDive.md             # full design/measurement/war-stories study guide
 └── README.md
@@ -149,7 +193,7 @@ sudo reboot                                                                    #
 ansible-playbook -i inventory/local.yml playbooks/site.yml -K                  # build + deploy + monitor
 ```
 
-Verify: `cat /proc/cmdline` (isolation params), `lscpu -e` (9/11/13/15 offline),
+Verify: `cat /proc/cmdline` (isolation params), `lscpu -e` (1/3 offline),
 `bod_check.sh` (READY), `curl localhost:8000/metrics`, netdata at
 `http://127.0.0.1:19999`.
 
@@ -170,8 +214,10 @@ Verify: `cat /proc/cmdline` (isolation params), `lscpu -e` (9/11/13/15 offline),
 ## The two live demos
 
 - **Latency injection** — `sudo ./scripts/latency_demo.sh on` adds `netem`
-  delay on loopback; `rtt` on the dashboard jumps ~10 ms (`t2t`, the engine
-  path, is unaffected — the point). `off` restores baseline.
+  delay on loopback; measured: `rtt` p50 goes **11.2 µs → 11.47 ms (1024×)**
+  while `t2t` p50 moves **466 → 490 ns (+5%)**. The engine path is essentially
+  untouched while the network path explodes — that three-orders-of-magnitude
+  difference in sensitivity is the point. `off` restores baseline.
 - **Failover / self-heal** — `sudo systemctl kill -s SIGKILL trading-engine` →
   systemd restarts it in ~2 s; a clean `systemctl stop` leaves it down and
   `bod_check.sh` returns **NOT READY (exit 2)** — the readiness gate.

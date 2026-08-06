@@ -40,6 +40,16 @@ namespace ts {
     return CPU_ISSET(static_cast<std::size_t>(cpu), &set) && CPU_COUNT(&set) == 1;
 }
 
+// Set the thread's kernel-visible name, so /proc/<pid>/task/<tid>/comm, `top -H`
+// and `htop` show "strategy" instead of five copies of "trading_engine" — which
+// is what makes the thread-to-core pinning auditable from outside the process
+// (see RUNBOOK.md §7). Limit is 15 chars + NUL; the kernel rejects anything
+// longer, so callers keep the names short. Called once at thread start, never on
+// the hot path.
+inline void name_thread(const char* name) noexcept {
+    static_cast<void>(pthread_setname_np(pthread_self(), name));
+}
+
 // Elevate to SCHED_FIFO at `prio` (1..99). Returns false if not permitted.
 [[nodiscard]] inline bool set_realtime(int prio) noexcept {
     sched_param p{};

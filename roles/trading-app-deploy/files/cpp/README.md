@@ -5,10 +5,10 @@ of the interview topic list. See `../../../../INTERVIEW_NOTES.md` for the full
 topic→file map.
 
 ```
-market-data (cpu8) --ring1--> strategy (cpu10) --ring2--> gateway (cpu12)
+market-data (cpu8) --ring1--> strategy (cpu9) --ring2--> gateway (cpu10)
                                                               |  FIX/TCP
      rdtsc t0 rides the whole pipeline                        v  loopback:9001
-     +------------------ round trip (rtt) --------------> exchange (cpu14)
+     +------------------ round trip (rtt) --------------> exchange (cpu11)
      (t2t = engine-only: t0 -> gateway about to send; rtt = t0 -> fill back)
 
 gateway --ring3--> logger (housekeeping)     metrics-http :8000 (housekeeping)
@@ -73,8 +73,19 @@ Under systemd (via the Ansible role) the flags come from
 
 ```bash
 # run on a FREE core (not one already running a busy FIFO hot thread)
-taskset -c 6 ./build/microbench
-# dispatch crtp vs virtual   0.46 vs 0.94 ns   (2.06x)
-# alloc    pool vs malloc    2.88 vs 12.58 ns  (4.36x)
-# map      flat vs unordered 1.02 vs 1.67 ns   (1.64x)
+taskset -c 2 ./build/microbench          # P-core (Golden Cove)
+# dispatch crtp vs virtual   0.25 vs 0.58 ns   (2.32x)
+# alloc    pool vs malloc    1.95 vs 10.41 ns  (5.33x)
+# map      flat vs unordered 0.75 vs 2.24 ns   (2.99x)
+
+taskset -c 6 ./build/microbench          # E-core (Gracemont)
+# dispatch crtp vs virtual   0.65 vs 1.15 ns   (1.76x)
+# alloc    pool vs malloc    2.68 vs 14.32 ns  (5.33x)
+# map      flat vs unordered 1.46 vs 1.80 ns   (1.23x)
 ```
+
+The ratios differ per core type — they are properties of a microarchitecture, not
+constants. Note also that these are the numbers from the *fixed* harness: the
+original wrote to a `volatile` inside the timed loop, which floored the
+measurement at store-forwarding latency and reported a bogus `1.00x` for dispatch
+on the P-cores (ProjectDeepDive.md §8).

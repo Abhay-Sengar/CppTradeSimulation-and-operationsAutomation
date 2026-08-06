@@ -8,7 +8,7 @@
   web files group = root
 
 # Per-core CPU utilization is off by default in Netdata; enable it so the four
-# isolated trading cores (8/10/12/14) are each visible as their own chart —
+# isolated trading cores (8/9/10/11) are each visible as their own chart —
 # pegged while the pipeline runs, with cpu0-7 idle.
 [plugin:proc:/proc/stat]
   per cpu core utilization = yes

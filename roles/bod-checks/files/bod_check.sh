@@ -11,8 +11,10 @@ CLOCK_OFFSET_MAX_MS="${CLOCK_OFFSET_MAX_MS:-50}"
 EXCHANGE_HOST="${EXCHANGE_HOST:-127.0.0.1}"
 EXCHANGE_PORT="${EXCHANGE_PORT:-9001}"
 SERVICES="${SERVICES:-ssh}"
-ISOLATED_CPUS="${ISOLATED_CPUS:-8-15}"
-OFFLINE_SIBLINGS="${OFFLINE_SIBLINGS:-9 11 13 15}"
+ISOLATED_CPUS="${ISOLATED_CPUS:-8-11}"
+# HT siblings of the housekeeping P-cores. The isolated hot cores are E-cores,
+# which have no SMT sibling — see roles/kernel-tuning/defaults/main.yml.
+OFFLINE_SIBLINGS="${OFFLINE_SIBLINGS:-1 3}"
 
 PASS=0; WARN=0; FAIL=0
 RESULTS=()
@@ -100,13 +102,17 @@ check_tsc() {
 
 check_smt_siblings() {
   local off=0 total=0 c st
+  if [ -z "${OFFLINE_SIBLINGS// /}" ]; then
+    record PASS "No SMT siblings to offline (hot cores have no hyper-threads)"
+    return
+  fi
   for c in $OFFLINE_SIBLINGS; do
     total=$((total + 1))
     st=$(cat "/sys/devices/system/cpu/cpu${c}/online" 2>/dev/null)
     [ "$st" = "0" ] && off=$((off + 1))
   done
   if [ "$off" -eq "$total" ] && [ "$total" -gt 0 ]; then
-    record PASS "SMT siblings offline (${OFFLINE_SIBLINGS}) — each hot core is dedicated"
+    record PASS "SMT siblings offline (${OFFLINE_SIBLINGS}) — housekeeping runs on full physical cores"
   else
     record WARN "SMT siblings not all offline: ${off}/${total} (${OFFLINE_SIBLINGS})"
   fi

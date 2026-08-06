@@ -42,7 +42,10 @@ set(SANITIZE "" CACHE STRING "address | thread | (empty for none)")
 
 # --- warning + optimisation flags (email §Compiler & Build, §Build & Tooling)-
 #  -O3            aggressive opt for the hot path
-#  -march=native  emit Zen3 (znver3) ISA incl. PAUSE for _mm_pause
+#  -march=native  emit the host ISA (here alderlake) incl. PAUSE for _mm_pause.
+#                 NOTE on hybrid CPUs: GCC resolves native to the ISA the P- and
+#                 E-cores have in COMMON, which is why AVX-512 is absent — the
+#                 E-cores don't implement it, so the package doesn't expose it.
 #  -fno-rtti      we use CRTP, never dynamic_cast; this is the "why not
 #                 dynamic_cast on the hot path" answer, enforced by the build
 #  -Wall -Wextra -Wconversion -Wshadow -Werror  the exact set from the email

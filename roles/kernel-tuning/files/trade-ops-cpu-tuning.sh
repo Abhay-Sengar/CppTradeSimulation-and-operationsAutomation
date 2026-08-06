@@ -12,7 +12,7 @@ set -uo pipefail
 CONF=/etc/trade-ops/cpu-tuning.conf
 [ -r "$CONF" ] && . "$CONF"
 
-OFFLINE_SIBLINGS="${OFFLINE_SIBLINGS:-9 11 13 15}"
+OFFLINE_SIBLINGS="${OFFLINE_SIBLINGS:-1 3}"
 GOVERNOR="${GOVERNOR:-performance}"
 DISABLE_TURBO="${DISABLE_TURBO:-0}"
 

@@ -8,18 +8,22 @@ recruiter's topic list maps to one of three states:
 - 📖 **pure study** — not in this codebase (usually DSA or a concept the setup
   can't show); the honest answer is "I know it, here's the summary."
 
-The live pipeline is `market-data (cpu8) → strategy (cpu10) → gateway (cpu12) →
-exchange (cpu14)`, three SPSC rings, FIX/TCP loopback, all under
+The live pipeline is `market-data (cpu8) → strategy (cpu9) → gateway (cpu10) →
+exchange (cpu11)`, three SPSC rings, FIX/TCP loopback, all under
 `roles/trading-app-deploy/files/cpp/`.
 
-Measured on this box (AMD Ryzen 7 7730U, isolated cores, `performance`
+Measured on this box (Intel Core i7-1255U, isolated E-cores, `performance`
 governor, RT throttling disabled — microbench min ns/op):
 
-| A/B | A | B | ratio |
-|---|---|---|---|
-| dispatch: CRTP vs virtual | 0.46 ns | 0.94 ns | 2.06× |
-| alloc: pool vs malloc | 2.88 ns | 12.58 ns | 4.36× |
-| map: flat vs `unordered_map` | 1.02 ns | 1.67 ns | 1.64× |
+| A/B | A | B | ratio (P-core) | ratio (E-core) |
+|---|---|---|---|---|
+| dispatch: CRTP vs virtual | 0.25 ns | 0.58 ns | 2.32× | 1.76× |
+| alloc: pool vs malloc | 1.95 ns | 10.41 ns | 5.33× | 5.33× |
+| map: flat vs `unordered_map` | 0.75 ns | 2.24 ns | 2.99× | 1.23× |
+
+(A/B columns are the P-core figures. The ratios differ by microarchitecture —
+worth saying out loud: these are properties of a core design, not universal
+constants. Previous hardware, Ryzen 7 7730U: 2.06× / 4.36× / 1.64×.)
 
 Live latency on the isolated cores (from `:8000/metrics`). **`t2t` is the
 engine-only number we optimise** (tick generated → order ready to send, fully
@@ -28,16 +32,28 @@ engine-only:
 
 | histogram | p50 | p99 | p999 | max |
 |---|---|---|---|---|
-| `t2t` — engine tick-to-trade (md→gateway) | 588 ns | 1.58 µs | 2.0 µs | 2.5 µs |
-| `rtt` — round trip incl. exchange (md→fill) | 43 µs | 59 µs | 67 µs | — |
+| `t2t` — engine tick-to-trade (md→gateway) | 474 ns | 700 ns | 2.67 µs | 20.4 µs |
+| `rtt` — round trip incl. exchange (md→fill) | 10.9 µs | 13.5 µs | 16.8 µs | 52 µs |
 
-The ~0.6µs `t2t` vs ~43µs `rtt` gap is the kernel/TCP stack cost —
-the live motivation for kernel bypass. Getting the `t2t` tail down to ~2µs
-required: isolcpus + nohz_full + SCHED_FIFO **with RT throttling disabled**
+(At 50k ticks/s. Previous hardware, Ryzen 7 7730U: `t2t` 588 ns / 1.58 µs /
+2.0 µs / 2.5 µs — better p50 and p99 here, worse far tail; see
+`ProjectDeepDive.md` §3a.)
+
+The ~0.5µs `t2t` vs ~11µs `rtt` gap is the kernel/TCP stack cost — the live
+motivation for kernel bypass. Getting the `t2t` tail down required: isolcpus +
+nohz_full + SCHED_FIFO **with RT throttling disabled**
 (`kernel.sched_rt_runtime_us=-1`) so the pinned FIFO thread is never stalled,
 and keeping the non-hot threads (logger/metrics) on housekeeping cores. Before
 that tuning the p99 was ~880 ms (RT throttle stalling the gateway) — a concrete
 lesson in why each knob matters.
+
+**Know the attribution, not just the total** (`scripts/ab_sweep.sh`, one flag
+flipped per run at 50k ticks/s — full table in `ProjectDeepDive.md` §7):
+pinning off = **10× p99 / 402× p999**; `malloc` = +27% p99, +75% max but **+0.6%
+mean**; hugepages off = +29% p99; FIFO off = +18% p99; CRTP→virtual =
+**unmeasurable** (+1%, inside the noise). The lesson to lead with: the per-op
+knobs buy *predictability*, not throughput — and a 0.5 ns vtable cost is 0.1% of
+a 470 ns path, so the microbench can see it and the engine histogram cannot.
 
 ---
 
@@ -108,7 +124,7 @@ lesson in why each knob matters.
 
 | Topic | State | Where / talking point |
 |---|---|---|
-| `-O3 -Ofast -march=native -flto -fno-exceptions -fno-rtti` | ✅ | `CMakeLists.txt`. `-fno-rtti` on (we use CRTP not dynamic_cast). `-march=native` = znver3. `-flto` optional. **Exceptions kept ON** — hot path is `noexcept`/alloc-free by discipline; `-fno-exceptions` program-wide fights `<future>`/`<thread>` for no hot-path gain. |
+| `-O3 -Ofast -march=native -flto -fno-exceptions -fno-rtti` | ✅ | `CMakeLists.txt`. `-fno-rtti` on (we use CRTP not dynamic_cast). `-march=native` = alderlake (hybrid: resolves to the ISA the P- and E-cores share, so no AVX-512). `-flto` optional. **Exceptions kept ON** — hot path is `noexcept`/alloc-free by discipline; `-fno-exceptions` program-wide fights `<future>`/`<thread>` for no hot-path gain. |
 | Why `-Ofast` safe when money is int64 | ✅ | `-Ofast` enables `-ffast-math`, which only changes **floating-point** semantics. All money math is `int64_t`, so there's no FP on the hot path to break. |
 | PGO two-phase | 📖 | `-fprofile-generate` → run a representative load → `-fprofile-use`. Feeds real branch/layout data back to the optimiser. Left out to keep the build one-step. |
 | ASan+UBSan vs TSan — why not combined | ✅ | `CMakeLists.txt` presets. Both hook shadow memory / the allocator and can't coexist. ASan+UBSan: use-after-free/OOB/UB. TSan: data races. Ship neither in `-O3`. |
@@ -117,11 +133,11 @@ lesson in why each knob matters.
 
 | Topic | State | Where / talking point |
 |---|---|---|
-| `isolcpus`, `nohz_full`, `rcu_nocbs` | ✅ | `roles/kernel-tuning/defaults/main.yml` cmdline. isolcpus keeps the scheduler off 8-15; nohz_full stops the tick when 1 runnable task; rcu_nocbs offloads RCU callbacks to housekeeping. |
+| `isolcpus`, `nohz_full`, `rcu_nocbs` | ✅ | `roles/kernel-tuning/defaults/main.yml` cmdline. isolcpus keeps the scheduler off 8-11; nohz_full stops the tick when 1 runnable task; rcu_nocbs offloads RCU callbacks to housekeeping. |
 | `SCHED_FIFO` + `pthread_setaffinity_np` in code | ✅ | `affinity.hpp` (`pin_to_cpu`, `set_realtime`, `AffinityGuard` RAII). Pin FIRST, verify, THEN go FIFO (safety). |
 | governor performance, disable turbo, stop irqbalance | ✅ | `trade-ops-cpu-tuning.sh` (governor + optional boost off), role stops irqbalance, `irqaffinity=0-7` on cmdline. |
 | `/proc/cpuinfo` `constant_tsc` / `nonstop_tsc` | ✅ | `tsc.hpp` `tsc_is_invariant()`; `bod_check.sh` `check_tsc`. |
-| SMT sibling offlining | ✅ | `trade-ops-cpu-tuning.sh` offlines 9/11/13/15 so each hot thread owns a full physical core. |
+| SMT sibling offlining | ✅ | `trade-ops-cpu-tuning.sh` offlines 1/3 — the HT siblings of the housekeeping P-cores. The hot cores are E-cores with no sibling, so the step moves to where SMT contention actually exists; see the hybrid-topology note in `ProjectDeepDive.md`. |
 
 ## Networking
 

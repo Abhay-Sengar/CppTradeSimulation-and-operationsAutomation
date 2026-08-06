@@ -3,7 +3,7 @@
 // Behaviour matches the original Python mock_exchange.py: ack the logon, and
 // fill every NewOrderSingle immediately with an ExecutionReport. C++ rewrite so
 // the whole round trip is native and the connection handler can be pinned to an
-// isolated core (cpu 14).
+// isolated core (cpu 11).
 //
 // Threads: main = acceptor; each connection is served by a handler thread pinned
 // to the exchange core. One client at a time (the engine).
@@ -32,7 +32,7 @@ void on_signal(int) {
 }
 
 struct Cfg {
-    int  cpu = 14;
+    int  cpu = 11;
     bool pin = false;
     bool rt = false;
     int  rt_prio = 80;
@@ -70,6 +70,7 @@ bool send_msg(int fd, fix::Builder& b, u64& seq, std::string_view mtype, BodyFn 
 }
 
 void handle(int fd, const Cfg& c) {
+    name_thread("fix-handler");   // observability: see RUNBOOK.md §7
     if (c.pin) {
         if (pin_to_cpu(c.cpu) && affinity_is(c.cpu)) {
             if (c.rt && !set_realtime(c.rt_prio))

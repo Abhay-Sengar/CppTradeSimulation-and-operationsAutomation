@@ -1,10 +1,13 @@
 // engine_main.cpp — the trading engine: a 3-hop, lock-free pipeline across
 // isolated cores, with runtime A/B toggles and a Prometheus metrics endpoint.
 //
-//   market-data (cpu 8) --ring1--> strategy (cpu 10) --ring2--> gateway (cpu 12)
+//   market-data (cpu 8) --ring1--> strategy (cpu 9) --ring2--> gateway (cpu 10)
 //        |                                                          |  FIX/TCP
 //        | rdtsc t0 rides the whole way                            v  loopback
-//        +---------------- round trip (rtt) -----------------> exchange (cpu 14)
+//        +---------------- round trip (rtt) -----------------> exchange (cpu 11)
+//
+// The four hot cores are the E-cores of one L2 cluster on the i7-1255U, so the
+// ring hand-offs stay L2-local; see roles/kernel-tuning/defaults/main.yml.
 //
 //   gateway --ring3--> logger (housekeeping)      metrics-http (housekeeping)
 //
@@ -62,7 +65,7 @@ struct Cfg {
     bool pin = false;            // --pin=on|off  (off in dev, on under systemd)
     bool rt = false;             // --rt=on|off   (SCHED_FIFO)
     u32  rate = 1000;            // --rate=<ticks/sec>
-    int  md_cpu = 8, strat_cpu = 10, gw_cpu = 12, rt_prio = 80;
+    int  md_cpu = 8, strat_cpu = 9, gw_cpu = 10, rt_prio = 80;
     const char* exch_ip = "127.0.0.1";
     const char* log_path = "/tmp/trading-engine.log";
 };
@@ -105,6 +108,7 @@ constexpr u64 kPendingMask = pending_capacity() - 1;
 
 // Try to pin + go real-time on the calling thread; log what actually happened.
 void setup_core(const char* name, const Cfg& c, int cpu) {
+    name_thread(name);   // observability: makes `top -H` / comm readable
     if (!c.pin) return;
     if (pin_to_cpu(cpu) && affinity_is(cpu)) {
         if (c.rt && !set_realtime(c.rt_prio))
@@ -242,6 +246,7 @@ void run_gateway(HotState& hs, const Cfg& c, const TscClock& clk, int fd) {
 
 // ---- logger: drain ring3 off the hot path, write to file -------------------
 void run_logger(HotState& hs, const Cfg& c) {
+    name_thread("logger");
     std::FILE* f = std::fopen(c.log_path, "w");
     LogEvent le;
     while (g_running.load(std::memory_order_relaxed) || hs.ring3.size_approx() > 0) {
@@ -298,6 +303,7 @@ std::string build_metrics(const HotState& hs, const TscClock& clk, bool on_huge)
 }
 
 void run_metrics(const HotState& hs, const TscClock& clk, bool on_huge) {
+    name_thread("metrics-http");
     const int lfd = net::listen_tcp("127.0.0.1", kMetricsPort);
     if (lfd < 0) {
         std::fprintf(stderr, "[metrics] listen on :%u failed\n", kMetricsPort);

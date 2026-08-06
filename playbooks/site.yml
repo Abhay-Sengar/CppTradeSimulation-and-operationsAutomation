@@ -2,6 +2,13 @@
 - name: Configure trading node
   hosts: trading_nodes
   become: true
+  # Run pending handlers even if a later task fails. Without this, a single failed
+  # task drops the host from the play and its queued handlers never fire — which
+  # is how a cosmetic "detect the preemption model" task once stopped
+  # `update-grub` from running, leaving /etc/default/grub correct but grub.cfg
+  # stale, so isolcpus silently did not survive the reboot. Handlers here apply
+  # config that has already been written; skipping them is worse than running them.
+  force_handlers: true
   roles:
     - { role: kernel-tuning, tags: ['kernel'] }
     - { role: monitoring-agent, tags: ['monitoring'] }

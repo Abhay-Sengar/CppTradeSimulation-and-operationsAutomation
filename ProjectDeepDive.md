@@ -63,28 +63,51 @@ stats) and Section 8 (war stories) are the two you can least afford to hand-wave
 
 ### The physical box
 
-Bare-metal Ubuntu 22.04 on an **AMD Ryzen 7 7730U** (Zen 3): 8 physical cores,
-16 logical CPUs (SMT/hyper-threading). The SMT sibling pairs are
-`(0,1) (2,3) … (8,9) (10,11) (12,13) (14,15)` — i.e. logical CPUs `8` and `9`
-are the two threads of physical core 4, and so on. 14 GB RAM, invariant TSC
-(`constant_tsc` + `nonstop_tsc`).
+Bare-metal Ubuntu 22.04 on an **Intel Core i7-1255U** (Alder Lake-U) — a
+**hybrid** CPU, 10 physical cores / 12 logical CPUs:
+
+```
+cpu0,1   P-core 0 (Golden Cove) HT siblings   0.4-4.7 GHz
+cpu2,3   P-core 1 (Golden Cove) HT siblings   0.4-4.7 GHz
+cpu4-7   4x E-core (Gracemont), no HT         0.4-3.5 GHz   L2 cluster A (2 MB shared)
+cpu8-11  4x E-core (Gracemont), no HT         0.4-3.5 GHz   L2 cluster B (2 MB shared)
+```
+
+15 GB RAM, invariant TSC (`constant_tsc` + `nonstop_tsc`), 12 MB shared L3,
+single socket (no real NUMA). Note the asymmetry that drives everything below:
+only the P-cores have SMT siblings, and the E-cores come in **clusters of four
+sharing one L2**.
 
 ### The core plan
 
 ```
- Housekeeping (cpu 0-7)              Isolated (cpu 8,10,12,14 = phys cores 4-7)
+ Housekeeping (cpu 0,2 + 4-7)        Isolated (cpu 8-11 = E-cores, one L2 cluster)
   ├ OS, systemd, Ansible              ├ market-data thread  -> cpu 8
-  ├ engine: logger + metrics-http     ├ strategy thread     -> cpu 10
-  ├ netdata, sshd                     ├ gateway thread      -> cpu 12
-  └ everything not pinned             └ mock-exchange        -> cpu 14
-                                      SMT siblings 9,11,13,15 = OFFLINE
+  ├ engine: logger + metrics-http     ├ strategy thread     -> cpu 9
+  ├ netdata, sshd                     ├ gateway thread      -> cpu 10
+  └ everything not pinned             └ mock-exchange        -> cpu 11
+ P-core HT siblings 1,3 = OFFLINE
 ```
 
 Why this shape:
-- **One hot thread per *physical* core.** We isolate all of cores 4-7 and take
-  the odd SMT siblings (9/11/13/15) **offline**, so each hot thread owns a whole
-  core with no hyper-thread contention (two SMT threads share execution units,
-  L1/L2 — a sibling running anything steals from the hot thread).
+- **All four hot cores share one L2.** The pipeline's whole job is passing cache
+  lines between hops (`ring1`: md→strategy, `ring2`: strategy→gateway). Placing
+  the four hot threads inside a single E-core cluster keeps those hand-offs
+  **L2-local** rather than round-tripping through L3. This is the main reason
+  cluster B was chosen as a block instead of spreading the threads across the
+  package.
+- **One hot thread per *physical* core, and here that is free.** Gracemont
+  E-cores have no SMT sibling at all, so each hot thread owns its core outright
+  with nothing to offline — the hyper-thread contention problem simply does not
+  exist on these cores.
+- **The SMT-offlining step moves to where SMT actually is.** cpu1 and cpu3 (the
+  HT siblings of the two P-cores) are taken offline instead, so the *housekeeping*
+  P-cores that run the engine's logger/metrics threads and netdata are full
+  physical cores. Two SMT threads share execution units and L1/L2, so this still
+  buys something — just for the non-hot work now.
+- **cpu0 is never isolated.** It is the boot CPU; `nohz_full` must exclude at
+  least one timekeeping CPU, and isolating cpu0 fights the kernel rather than
+  helping. It stays housekeeping deliberately.
 - **Every isolated core does real work.** This is an in-person interview, so
   there's no video call competing for CPU — so instead of reserving cores
   idle, the pipeline is a 3-hop chain plus the exchange, exercising
@@ -98,15 +121,82 @@ reboot) for `isolcpus`/`nohz_full`/`rcu_nocbs`/`hugepages`, and a **systemd
 oneshot** (`trade-ops-cpu.service`) that offlines siblings and sets the governor
 at every boot (reversible — disable the unit to revert). Details in §9.
 
+### 3a. Porting the core plan to different hardware (a real migration)
+
+This project was originally built and measured on an **AMD Ryzen 7 7730U**
+(Zen 3): 8 physical cores / 16 logical CPUs, SMT pairs `(0,1) (2,3) … (14,15)`,
+hot threads on `8,10,12,14` with the odd siblings `9,11,13,15` offlined. It was
+then moved to the hybrid Intel box above. The migration is worth walking through
+because it shows which parts of a low-latency deployment are *portable
+principles* and which are *facts about one machine*:
+
+| | Ryzen 7 7730U | i7-1255U | portable? |
+|---|---|---|---|
+| Logical CPUs | 16 | **12** — `cpu12`/`cpu14` don't exist | no |
+| Hot cores | 8,10,12,14 | **8,9,10,11** | no |
+| Offlined siblings | 9,11,13,15 (siblings of hot cores) | **1,3** (siblings of housekeeping P-cores) | the *reason* is, the list isn't |
+| "One hot thread per physical core" | via offlining siblings | free — E-cores have no siblings | **yes** |
+| Keep the boot CPU out of `isolcpus` | cpu0 housekeeping | cpu0 housekeeping | **yes** |
+| Keep ring hand-offs cache-local | same CCX | same E-core L2 cluster | **yes** |
+| `-march=native` | `znver3` | `alderlake` (no AVX-512: the E-cores don't implement it, so the package doesn't expose it) | mechanism yes |
+
+Three things bit, and each is a lesson:
+
+1. **Pinning to a CPU that doesn't exist fails silently-ish.** `pin_to_cpu(12)`
+   returns false, `setup_core` prints `pin to cpu 12 failed` and the thread keeps
+   running — *unpinned*. The engine doesn't crash; it just quietly loses its
+   isolation guarantee and its tail latency. This is why the BOD check verifies
+   topology rather than trusting the config, and why the startup line prints the
+   effective config.
+2. **`OFFLINE_SIBLINGS=9 11 13 15` would have been actively harmful here** —
+   `cpu9` and `cpu11` are E-cores this box needs as *hot* cores, and `13`/`15`
+   don't exist. A hard-coded sibling list is a machine fact masquerading as
+   config. The fix is that the list lives in
+   `roles/kernel-tuning/defaults/main.yml` and flows to both
+   `trade-ops-cpu-tuning.sh` and `bod_check.sh` through generated conf files, so
+   one edit retargets the whole stack.
+3. **Hybrid CPUs raise a real question about `rdtsc`.** If the P-cores run at
+   4.7 GHz and the E-cores at 3.5 GHz, is a counter stamped on one comparable to
+   one read on the other? Yes — the TSC is not the core clock. It is derived from
+   the platform crystal at a fixed ratio (here 38.4 MHz × 68 = **2611.2 MHz**)
+   and is common to the whole package, which is exactly what `constant_tsc`
+   guarantees. The engine's own calibration measures **2.611 GHz**, matching the
+   kernel's independent `tsc: Detected 2611.200 MHz TSC` to four significant
+   figures. See `include/tsc.hpp`.
+
+The E-cores cap at 3.5 GHz with lower IPC than Zen 3, so absolute `t2t` was
+expected to regress. The measured answer is **split**, and worth stating
+precisely (both columns fully tuned, §7):
+
+| `t2t` | Ryzen 7 7730U | i7-1255U isolated E-cores | |
+|---|---|---|---|
+| p50 | 588 ns | **474 ns** | −19% better |
+| p99 | 1.58 µs | **700 ns** | −56% better |
+| p999 | 2.0 µs | 2.67 µs | +34% worse |
+| max | 2.5 µs | 20.4 µs | 8× worse |
+
+**Typical latency improved; the far tail got worse.** The gain is cache locality —
+four hot threads inside one E-core L2 cluster hand off cache lines without
+crossing the Ryzen's wider hierarchy, which is exactly what a 3-hop ring pipeline
+is bottlenecked on. The loss is that this is a 15 W laptop part whose E-cores
+share a power and thermal envelope with the whole package, so the rare excursions
+are larger; the Ryzen held a 2.5 µs max. Neither the frequency nor the IPC deficit
+showed up where the naive prediction said it would, because the pipeline is
+memory-bound between hops rather than compute-bound inside them.
+
+The *ratios* in the microbenchmark table are the more durable claim than any
+absolute nanosecond figure — though §7 shows even those are microarchitecture-
+dependent.
+
 ---
 
 ## 4. The trading engine: C++ architecture (the 3-hop pipeline)
 
 ```
-market-data (cpu8) --ring1--> strategy (cpu10) --ring2--> gateway (cpu12)
+market-data (cpu8) --ring1--> strategy (cpu9) --ring2--> gateway (cpu10)
      |                                                        |  FIX/TCP
      | rdtsc t0 stamped here, rides the whole pipeline        v  loopback :9001
-     +------------------- round trip (rtt) ------------> mock-exchange (cpu14)
+     +------------------- round trip (rtt) ------------> mock-exchange (cpu11)
                                                              |
 gateway --ring3--> logger (housekeeping)   metrics-http :8000 (housekeeping)
 ```
@@ -116,8 +206,8 @@ Six threads in the engine process:
 | Thread | Core | Sched | Job |
 |---|---|---|---|
 | market-data | 8 | FIFO | generate synthetic top-of-book ticks, stamp `rdtsc`, push ring1 |
-| strategy | 10 | FIFO | pop ring1, decide side/price, encode FIX, push ring2 |
-| gateway | 12 | FIFO | pop ring2, send FIX, match ExecutionReports, record latency, push log events to ring3 |
+| strategy | 9 | FIFO | pop ring1, decide side/price, encode FIX, push ring2 |
+| gateway | 10 | FIFO | pop ring2, send FIX, match ExecutionReports, record latency, push log events to ring3 |
 | logger | 0-7 | OTHER | pop ring3, write to file (off the hot path) |
 | metrics-http | 0-7 | OTHER | serve Prometheus text on `:8000/metrics` |
 | main | 0-7 | OTHER | startup, TSC calibration, signal handling, join |
@@ -125,7 +215,7 @@ Six threads in the engine process:
 The three hot threads communicate through **SPSC (single-producer /
 single-consumer) lock-free ring buffers** — no locks, no syscalls, no
 allocation on the hot path. The mock exchange is a separate process pinned to
-cpu 14.
+cpu 11.
 
 **Ring payloads** (`messages.hpp`), all trivially-copyable POD:
 - `ring1` `Tick{ t0_tsc, sym_id, seq, bid, ask }`
@@ -190,7 +280,7 @@ Two variants (`tsc.hpp`):
 **Why rdtsc is valid here.** The box has **invariant TSC** (`constant_tsc` +
 `nonstop_tsc`): the counter ticks at a fixed nominal rate regardless of
 P-state/turbo, doesn't stop in idle, and is synchronised across cores. That last
-property is what lets us stamp a tick on cpu 8 and read the counter on cpu 12
+property is what lets us stamp a tick on cpu 8 and read the counter on cpu 10
 and subtract — cross-core rdtsc subtraction is only valid *because* the TSC is
 invariant. (`tsc_is_invariant()` checks the flags; `bod_check.sh` gates on it.)
 
@@ -199,8 +289,13 @@ invariant. (`tsc_is_invariant()` checks the flags; `bod_check.sh` gates on it.)
 rdtsc counts **cycles**, not nanoseconds. `TscClock::calibrate()` reads the TSC
 and `CLOCK_MONOTONIC_RAW` at two points ~100 ms apart and divides to get
 `ns_per_tick`. We use `MONOTONIC_RAW` (not `MONOTONIC`) so NTP slewing can't
-distort the ratio. On this box it measures ≈0.50 ns/tick ≈ **1.996 GHz** — the
-7730U's 2.0 GHz base clock, which is exactly what an invariant TSC counts at.
+distort the ratio. On this box it measures ≈0.383 ns/tick ≈ **2.611 GHz** — the
+platform-derived TSC rate (38.4 MHz crystal × 68 = 2611.2 MHz), *not* any core's
+current clock, which is exactly what an invariant TSC counts at. Cross-check:
+`journalctl -k | grep tsc` shows the kernel's own `Detected 2611.200 MHz TSC`,
+agreeing with our calibration to four significant figures. On a hybrid CPU this
+is the whole ballgame — the P-cores and E-cores run at different speeds, but they
+all count the same TSC (see §3a).
 Calibration runs on a `std::async` worker so its window overlaps the rest of
 startup (`std::future` demo).
 
@@ -209,8 +304,8 @@ startup (`std::future` demo).
 | Point | Thread | Call | Purpose |
 |---|---|---|---|
 | `t0` = tick generated | market-data (cpu8) | `rdtsc_fast()` → `Tick.t0_tsc` | the stopwatch **start** |
-| `t2t` end | gateway (cpu12) | `rdtsc_fast()` just **before `send()`** | order encoded & ready |
-| `rtt` end | gateway (cpu12) | `rdtsc_fast()` when **ExecutionReport arrives** | fill received |
+| `t2t` end | gateway (cpu10) | `rdtsc_fast()` just **before `send()`** | order encoded & ready |
+| `rtt` end | gateway (cpu10) | `rdtsc_fast()` when **ExecutionReport arrives** | fill received |
 
 The gateway keeps `t0` in a **direct-mapped array** `t0_by_id[clordid & MASK]`
 (O(1), no hashing — clordids are monotonic), so when a fill comes back it looks
@@ -288,27 +383,94 @@ Two complementary tools:
 - **The live engine** `t2t` histogram shows the *tail* effects (allocation
   jitter, isolation, hugepages) that a microbench mean can't.
 
-### Microbench (isolated core, performance governor)
+### Microbench (quiet box, performance governor, min over 21 trials)
 
-| Experiment | A | B | ratio | Why |
-|---|---|---|---|---|
-| dispatch: CRTP vs `virtual` | 0.46 ns | 0.94 ns | **2.06×** | vtable load + indirect (un-inlinable) branch |
-| alloc: pool vs `malloc` | 2.88 ns | 12.58 ns | **4.36×** | allocator bookkeeping/locks vs O(1) free-list |
-| map: flat vs `unordered_map` | 1.02 ns | 1.67 ns | **1.64×** | contiguous probing vs node pointer-chasing |
+Run per core *type*, because on a hybrid CPU that matters:
 
-### Live pipeline (isolated cores, RT, throttling disabled)
+| Experiment | P-core (cpu2) | E-core (cpu8, isolated) | Why |
+|---|---|---|---|
+| dispatch: CRTP vs `virtual` | 0.25 → 0.58 ns (**2.32×**) | 0.65 → 1.15 ns (**1.76×**) | vtable load + indirect (un-inlinable) branch |
+| alloc: pool vs `malloc` | 1.95 → 10.41 ns (**5.33×**) | 2.68 → 14.32 ns (**5.33×**) | allocator bookkeeping/locks vs O(1) free-list |
+| map: flat vs `unordered_map` | 0.75 → 2.24 ns (**2.99×**) | 1.46 → 1.80 ns (**1.23×**) | contiguous probing vs node pointer-chasing |
+
+The P-core is uniformly faster in absolute terms (Golden Cove is wider and
+clocks higher), and the *ratios* differ by microarchitecture — Gracemont's
+narrower frontend narrows the CRTP win, and its different L1/probe behaviour
+nearly erases the flat-map win. Same source, same flags, same binary: the
+"obvious" A/B ratios are properties of a microarchitecture, not universal truths.
+
+> These numbers are from the **fixed** benchmark. The original version wrote to a
+> `volatile` accumulator *inside* the timed loop, which floored every measurement
+> at store-to-load-forwarding latency and reported a nonsense `1.00×` for
+> dispatch on the P-cores. See §8.
+
+### Live pipeline (isolated cores, RT, throttling disabled, 50k ticks/s)
 
 | Histogram | p50 | p99 | p999 | max |
 |---|---|---|---|---|
-| `t2t` (engine tick-to-trade) | **588 ns** | **1.58 µs** | **2.0 µs** | 2.5 µs |
-| `rtt` (round trip, incl. exchange) | 43 µs | 59 µs | 67 µs | — |
+| `t2t` (engine tick-to-trade) | **474 ns** | **700 ns** | **2.67 µs** | 20.4 µs |
+| `rtt` (round trip, incl. exchange) | 10.9 µs | 13.5 µs | 16.8 µs | 52 µs |
 
-Reading them together: the microbench proves *why* each banned construct is
-banned (mean cost); the live `t2t` proves the whole pipeline holds a
-**~2 µs p999** on real hardware; the `rtt`/`t2t` gap (~70×) is the kernel/TCP
-tax. Benchmark hygiene throughout: isolated core, performance governor, warm-up
-iterations, min-over-trials, `do_not_optimize` compiler barriers, production
-build flags.
+### Attribution: what each knob is worth, measured
+
+`scripts/ab_sweep.sh` stops the service and runs the *same binary* once per
+variant with one runtime flag flipped, 1.5 M orders each at 50k ticks/s. Deltas
+are against the baseline row:
+
+| variant | p50 | p99 | p999 | max | mean |
+|---|---|---|---|---|---|
+| baseline (crtp/pool/huge/pin/rt) | 474 | 700 | 2672 | 20410 | 483 |
+| `--dispatch=virtual` | 474 | 708 (+1%) | 2704 | 21716 | 483 (**0%**) |
+| `--alloc=malloc` | 470 | 892 (+27%) | 3120 | 35689 (+75%) | 486 |
+| `--huge=off` | 466 | 900 (+29%) | 2896 | 34041 (+67%) | 480 |
+| `--rt=off` | 478 | 828 (+18%) | 2800 | 39464 (+93%) | 490 |
+| `--pin=off` | 430 | 7008 (**10×**) | 1073152 (**402×**) | 3137560 (**154×**) | 3674 (**7.6×**) |
+| all three per-op knobs off | 470 | 836 (+19%) | 3216 | 29197 | 485 |
+
+**How to read this — five conclusions, including one against our own thesis:**
+
+1. **`p50` is immovable at ~470 ns.** No per-op knob touches the median; it is
+   fixed pipeline cost (two ring hand-offs + FIX encode). Anyone claiming a
+   design change "halved our median" on a path like this is measuring something
+   else.
+2. **CRTP vs `virtual` is unmeasurable at engine level** — p99 700→708, mean
+   483→483, i.e. inside the noise. This is *not* a contradiction of the
+   microbench: the vtable costs 0.5 ns, which is **0.1% of a 470 ns path**. The
+   microbench is right and the engine histogram is right; they answer different
+   questions. Keep CRTP for the hot inner loops where it compounds, but don't
+   claim an end-to-end win you cannot measure.
+3. **`malloc`, no-hugepages and no-FIFO cost the TAIL, not the mean.** Each moves
+   the mean ≤1.4% and the max by 67–93%. That reframes the whole argument for
+   these three: they buy **predictability**, not throughput. Malloc's real price
+   is variance (slow paths, arena locks, page faults), not its average cost.
+4. **The knobs are not additive.** Flipping all three per-op knobs at once gives
+   p99 836 — no worse than `malloc` alone at 892. Their tail contributions
+   overlap (they perturb the same cache/TLB/scheduling behaviour) rather than sum.
+5. **Pinning is the one that matters, and load is what proves it.** At 2k
+   ticks/s, `--pin=off` cost 3× at p99. At 50k ticks/s it costs **10× at p99 and
+   402× at p999** (p999 = 1.07 ms, max = 3.14 ms). Unpinned threads migrate and
+   contend, and the damage scales with load — which is exactly why you cannot
+   validate a low-latency deployment at idle.
+
+**Duty cycle is why the rate matters.** At 2k ticks/s a tick arrives every 500 µs
+while `t2t` is ~0.5 µs — a **0.1% duty cycle**, so every tick lands on cold caches
+and cold predictors and ~500 ns of cache-miss work drowns every per-op delta. At
+50k ticks/s (2.5% duty cycle) the path stays warm and `malloc`/hugepage effects
+become visible. A first sweep at 2k/s showed *nothing but* `--pin=off`, and two
+variants even scored "better" than baseline — that was the ±700 ns run-to-run
+noise floor at p99, not a result. Fix: raise the rate, take 1.5 M samples per
+variant, and quote a noise floor before quoting a delta.
+
+**Bonus finding — load made the round trip *more* predictable.** `rtt` p999 went
+from 95.7 µs at 2k ticks/s to **16.8 µs at 50k ticks/s**. At the low rate the mock
+exchange's handler thread blocks in `recv()` between messages and pays a
+wake-up/scheduling latency on each one; under load it never sleeps and stays hot.
+This is the same reason production systems busy-poll instead of blocking, observed
+by accident in our own mock exchange.
+
+Benchmark hygiene throughout: isolated core, performance governor, warm-up
+iterations, min-over-trials, compiler barriers that do **not** perturb the timed
+loop (§8), production build flags, and a stated noise floor.
 
 ---
 
@@ -316,6 +478,72 @@ build flags.
 
 Real bring-up problems on the bare-metal box. Each is a good "tell me about a
 bug you debugged" answer.
+
+**Q: Your own microbenchmark said CRTP and `virtual` cost *exactly the same*
+(1.00×) on the P-cores, while the E-cores said 1.71×. Which one lied, and why?**
+> Both were reporting honestly; the benchmark was measuring the wrong thing. The
+> harness kept results alive with a **`volatile` read-modify-write inside the
+> timed loop**:
+> ```cpp
+> volatile u64 g_sink = 0;
+> ...
+> g_sink = g_sink + static_cast<u64>(o.px);   // every iteration
+> ```
+> `volatile` forces a real load **and** store each iteration, creating a
+> loop-carried dependency through **store-to-load forwarding**. That chain, not
+> the code under test, set the floor of the measurement — and the floor is
+> microarchitecture-specific: ~6 cycles on Golden Cove (1.60 ns at ~3.8 GHz)
+> versus ~2 cycles on Gracemont (0.67 ns at ~3.4 GHz). Dispatch costs well under
+> a nanosecond, so on the P-core the floor **exceeded the signal** and both arms
+> pinned to the same 1.60 ns → a meaningless `1.00×`. The alloc and map arms do
+> much more work per iteration, cleared the floor, and were unaffected.
+>
+> **Diagnosis path:** the P-core reporting *slower* absolute numbers than an
+> E-core on identical code is physically implausible, so the benchmark — not the
+> silicon — was the suspect. Ruled out frequency first with an independent
+> dependent-op-chain test (P-core 1.75 vs E-core 1.36 G-iter/s at ~3.8 GHz — the
+> P-core *is* faster), which left the harness. Then the tell: `crtp` and
+> `virtual` reporting the *identical* 1.60 ns is the signature of a shared
+> bottleneck, not of two different code paths.
+>
+> **Fix:** the body now *returns* its value, `bench()` accumulates into a plain
+> local register (one cycle of add latency), and the `volatile` is touched once
+> per `bench()` call **outside** the timed region. Result:
+>
+> | P-core, cpu2 | before | after |
+> |---|---|---|
+> | CRTP | 1.60 ns | **0.26 ns** |
+> | `virtual` | 1.60 ns | **0.58 ns** |
+> | ratio | 1.00× (bogus) | **2.26×** |
+> | flat vs `unordered_map` | 1.59× | **2.70×** |
+>
+> The floor had been hiding **6× of the signal**, and the corrected 2.26×
+> reproduces the 2.06× originally measured on the Ryzen. Lessons: `volatile` is
+> **not** a benchmarking barrier — it is a *memory* barrier with a latency cost,
+> and the right tool is an asm barrier (`asm volatile("" : : "g"(p) : "memory")`)
+> or accumulation in a register; and always sanity-check that your fastest
+> hardware posts your fastest numbers.
+
+**Q: `lscpu -e` showed your four isolated cores at 400 MHz while the engine was
+running. Had the governor failed?**
+> No — the cores were at 100% utilisation and the frequency *reading* was stale.
+> Measured busy time from `/proc/stat` directly: cpu8/9/10 at **100.0%**,
+> cpu0-7 at 4-6%. Then read `scaling_cur_freq` five times a second apart: the
+> isolated cores returned a **frozen** `400000` every time while housekeeping
+> cores returned live, varying values (3.50, 3.49, 3.44 GHz…). A frozen counter,
+> not a plausible frequency.
+>
+> **Cause:** `intel_pstate` updates its frequency estimate from a **scheduler-tick
+> driven** callback. `nohz_full=8-11` stops the tick on exactly those cores when
+> one task is runnable — which is the entire point of enabling it — so the
+> estimate is never refreshed and reports the last value it saw (the idle floor,
+> sampled at boot).
+>
+> The irony is the lesson: **the isolation you enable breaks the tool you would
+> normally use to verify it.** On a `nohz_full` core, verify frequency with
+> `turbostat` (reads APERF/MPERF directly), or via MSRs, or infer it from
+> achieved work — not from `scaling_cur_freq`. cpu11 legitimately sits near idle
+> (1.8%): the exchange handler blocks in `recv()` rather than spinning.
 
 **Q: The pipeline p99 was 884 ms and p999 was 1.78 s — on isolated cores. What?**
 > Two compounding causes. (1) The systemd unit pinned the *whole* engine process
@@ -367,6 +595,41 @@ bug you debugged" answer.
 > appeared in `grub.cfg`, rebooted. Lesson: verify the *generated* artifact
 > (`grub.cfg`), not just the source (`/etc/default/grub`).
 
+**Q: It happened AGAIN on the new hardware — same symptom, different cause. What
+was it, and what's the real fix?**
+> The kernel role ended with `failed=1` on a *cosmetic* task: "detect the kernel
+> preemption model" ran `cat /sys/kernel/debug/sched/preempt` and got
+> `Operation not permitted`. **Root cause:** this machine has **Secure Boot
+> enabled**, which puts the kernel in **lockdown `integrity` mode**
+> (`/sys/kernel/security/lockdown` → `none [integrity] confidentiality`), and
+> lockdown denies debugfs reads *even to root*. The task guarded itself with
+> `[ -r "$f" ]`, which passed — the mode bits do say readable — and then the read
+> itself returned `EPERM`. **A permission-bit test does not capture LSM/lockdown
+> policy.**
+>
+> The damage wasn't the failed task, it was the blast radius: when a host fails,
+> Ansible drops it from the play, so its **queued handlers never run**. The
+> `Update grub` handler was pending from the `lineinfile` task earlier in the
+> role. Result: `/etc/default/grub` was perfect, `grub.cfg` was stale (`grep -c
+> isolcpus=8-11 /boot/grub/grub.cfg` → **0**), and rebooting at that point would
+> have come up with no isolation while every config file on disk claimed
+> otherwise. The dangerous part is that it looks like success.
+>
+> **Two fixes, both needed:**
+> 1. *Attempt the read, don't predict it* — `if preempt=$(cat … 2>/dev/null);
+>    then … else <fallback>; fi`, plus `failed_when: false`, because an
+>    informational task must never gate a converge.
+> 2. **`force_handlers: true`** on the play — a late failure can no longer strand
+>    a pending handler. Handlers here apply config that is *already written to
+>    disk*; running them is strictly safer than skipping them.
+>
+> Lessons: (a) test capability by *doing the thing*, not by inspecting metadata —
+> permission bits, `[ -r ]`, and `os.access()` all lie under lockdown/SELinux;
+> (b) know your automation's failure semantics — "one unrelated task failed" and
+> "my critical handler silently didn't run" are the same event in Ansible;
+> (c) verify the generated artifact, again. The check that caught it was
+> `grep -c isolcpus /boot/grub/grub.cfg`, not the playbook's own output.
+
 **Q: SMT siblings wouldn't offline at boot — `write error: Device or resource busy`.**
 > The oneshot ran at `sysinit.target` (`DefaultDependencies=no`) — too early;
 > the CPU-hotplug offline write returns EBUSY while the scheduler is still
@@ -390,15 +653,15 @@ Delivered by the `kernel-tuning` role. Boot-time params (GRUB cmdline, need a
 reboot) and runtime params (sysctl + the cpu oneshot).
 
 **GRUB cmdline** (`/proc/cmdline` after reboot):
-`isolcpus=8-15 nohz_full=8-15 rcu_nocbs=8-15 irqaffinity=0-7
+`isolcpus=8-11 nohz_full=8-11 rcu_nocbs=8-11 irqaffinity=0-7
 transparent_hugepage=never default_hugepagesz=2M hugepagesz=2M hugepages=512`
 
-- **`isolcpus=8-15`** — remove logical CPUs 8-15 from the scheduler's automatic
+- **`isolcpus=8-11`** — remove logical CPUs 8-11 from the scheduler's automatic
   load-balancer; only explicitly-pinned threads land there.
-- **`nohz_full=8-15`** — stop the periodic ~1000 Hz timer tick on those cores
+- **`nohz_full=8-11`** — stop the periodic ~1000 Hz timer tick on those cores
   when only one task runs there (needs `rcu_nocbs`). Fewer interrupts = less
   jitter.
-- **`rcu_nocbs=8-15`** — offload RCU callback processing to housekeeping cores.
+- **`rcu_nocbs=8-11`** — offload RCU callback processing to housekeeping cores.
 - **`irqaffinity=0-7`** — route device IRQs to housekeeping cores from boot.
 - **`transparent_hugepage=never`** — THP is assembled/split lazily by
   khugepaged at unpredictable times (jitter); use explicit huge pages instead.
@@ -414,7 +677,7 @@ transparent_hugepage=never default_hugepagesz=2M hugepagesz=2M hugepages=512`
   `netdev_max_backlog=5000`, `tcp_fastopen=3`.
 
 **The cpu oneshot** (`trade-ops-cpu.service`, every boot, reversible):
-offlines SMT siblings 9/11/13/15 (so each hot core is dedicated), sets the
+offlines SMT siblings 1/3 (the housekeeping P-cores' HT siblings), sets the
 governor to **performance**, and optionally disables turbo (off by default; on
 for benchmark-stable numbers). Plus **global `CPUAffinity=0-7`** in
 `/etc/systemd/system.conf` so every *other* systemd service defaults off the
@@ -493,7 +756,7 @@ Tags used: header `8/9/35/49/56/34/52`; `A` Logon (`98/108`); `D` NewOrderSingle
 heartbeat/testrequest; trailer `10` CheckSum.
 
 - **`mock_exchange.cpp`** — acceptor on `127.0.0.1:9001`, connection handler
-  pinned to cpu 14; acks logon, fills every NewOrderSingle instantly with an
+  pinned to cpu 11; acks logon, fills every NewOrderSingle instantly with an
   ExecutionReport.
 - **`engine_main.cpp`** — the pipeline of §4.
 
@@ -540,8 +803,8 @@ showing the gate would block a market open.
 | # | From | To | Channel | What |
 |---|---|---|---|---|
 | 1 | Ansible (local, or a remote control host) | trading node | local / SSH 22 | config, C++ build, service control |
-| 2 | market-data thread | strategy thread | ring1 (in-process, cpu8→10) | `Tick` |
-| 3 | strategy thread | gateway thread | ring2 (in-process, cpu10→12) | `Order` (+ encoded FIX) |
+| 2 | market-data thread | strategy thread | ring1 (in-process, cpu8→9) | `Tick` |
+| 3 | strategy thread | gateway thread | ring2 (in-process, cpu9→10) | `Order` (+ encoded FIX) |
 | 4 | gateway | mock-exchange | TCP 9001 loopback | FIX NewOrderSingle |
 | 5 | mock-exchange | gateway | TCP 9001 loopback | FIX ExecutionReport |
 | 6 | gateway | logger thread | ring3 (in-process → cpu0-7) | `LogEvent` |

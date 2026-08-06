@@ -5,11 +5,14 @@ trading_app_user: trader
 trading_metrics_port: 8000
 trading_exchange_port: 9001
 
-# One hot thread pinned per physical isolated core (siblings offline).
+# One hot thread pinned per isolated core. These are the four E-cores of L2
+# cluster B on the i7-1255U (see roles/kernel-tuning/defaults/main.yml) — they
+# share an L2, so the ring hand-offs between hops stay L2-local. E-cores have no
+# SMT sibling, so each hot thread owns its core outright with nothing to offline.
 trading_md_cpu: 8
-trading_strategy_cpu: 10
-trading_gateway_cpu: 12
-trading_exchange_cpu: 14
+trading_strategy_cpu: 9
+trading_gateway_cpu: 10
+trading_exchange_cpu: 11
 trading_rt_prio: 80
 # Housekeeping cores for the process's NON-hot threads (logger, metrics-http,
 # main). The unit affinity must include these AND the isolated cores: the hot

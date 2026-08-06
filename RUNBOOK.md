@@ -22,8 +22,8 @@ Command-first. For *why* any of it works, see
 | BOD script / config | `/usr/local/bin/bod_check.sh` · `/etc/trade-ops/bod.conf` |
 | systemd services | `mock-exchange` · `trading-engine` · `netdata` · `trade-ops-cpu` |
 | systemd timer | `bod-check.timer` (Mon–Fri 08:45 IST) |
-| Isolated cores | `8` md · `10` strategy · `12` gateway · `14` exchange |
-| Repo | `/home/abhayps/Desktop/HFT/CppTradeSimulation-and-operationsAutomation` |
+| Isolated cores | `8` md · `9` strategy · `10` gateway · `11` exchange |
+| Repo | `/home/cdot/Desktop/HFT/CppTradeSimulation-and-operationsAutomation` |
 
 ---
 
@@ -63,7 +63,7 @@ tail -f /tmp/trading-engine.log                   # the engine's own event log (
 ```
 
 The engine's startup line in `journalctl` shows the effective config, e.g.
-`dispatch=crtp alloc=pool huge=on(on_pages=1) pin=1 rt=1 rate=2000 tsc=1.996GHz`.
+`dispatch=crtp alloc=pool huge=on(on_pages=1) pin=1 rt=1 rate=2000 tsc=2.611GHz`.
 
 ---
 
@@ -125,8 +125,10 @@ sudo ./scripts/latency_demo.sh off     # restore baseline
 ```
 
 **Observe:** `engine_rtt_*` spikes (round trip crosses loopback); `engine_t2t_*`
-(the engine compute path) is **unaffected** — which is itself the lesson about
-what you do and don't control.
+(the engine compute path) barely moves. Measured: `rtt` p50 11.2 µs → **11.47 ms**
+(1024×), `t2t` p50 466 → **490 ns** (+5%, and partly just the cumulative
+histogram re-mixing). Don't oversell it as "zero change" — the honest version is
+stronger: the path you own is ~1000× less sensitive than the path you don't.
 
 ---
 
@@ -134,9 +136,9 @@ what you do and don't control.
 
 | Want to see… | Command / place |
 |---|---|
-| Hot cores pegged, housekeeping idle | Netdata → **System → CPU** → per-core `cpu8/10/12/14` ~100%, `cpu0-7` low |
+| Hot cores pegged, housekeeping idle | Netdata → **System → CPU** → per-core `cpu8/9/10/11` ~100%, `cpu0-7` low |
 | Thread → core pinning | `for t in /proc/$(pgrep -x trading_engine)/task/*; do echo "$(cat $t/comm) $(taskset -cp $(basename $t))"; done` |
-| Isolation is live | `cat /proc/cmdline` (isolcpus…), `lscpu -e` (9/11/13/15 offline) |
+| Isolation is live | `cat /proc/cmdline` (isolcpus…), `lscpu -e` (1/3 offline) |
 | Hugepages in use | `grep HugePages_ /proc/meminfo` (Free < Total) |
 | Engine latency (t2t/rtt) | `curl -s localhost:8000/metrics \| grep _ns` |
 | Order flow rate | `curl … \| grep orders_total` (watch it climb) |
@@ -162,15 +164,27 @@ binary with flags, then restart. (Run as root for SCHED_FIFO + hugepages.)
 sudo systemctl stop trading-engine
 sudo /opt/trade-ops/app/bin/trading_engine \
      --dispatch=virtual --alloc=malloc --huge=on --pin=on --rt=on \
-     --md-cpu=8 --strat-cpu=10 --gw-cpu=12 --rate=2000
+     --md-cpu=8 --strat-cpu=9 --gw-cpu=10 --rate=2000
 #   ^ compare engine_t2t_p99_ns vs the crtp/pool baseline, then Ctrl-C
 sudo systemctl start trading-engine
 ```
 
 **Clean per-op A/B (microbench):** run on a FREE core (not a busy isolated one):
 ```bash
-taskset -c 6 /opt/trade-ops/src/build/microbench
+taskset -c 6 /opt/trade-ops/src/build/microbench    # housekeeping E-core
+taskset -c 2 /opt/trade-ops/src/build/microbench    # P-core — different ratios, see ProjectDeepDive §7
 ```
+
+**Full attribution sweep (what each knob is worth):** stops the engine, runs the
+microbench on a P-core / housekeeping E-core / isolated E-core, then one engine
+variant per flag, then restarts the service. ~5 min:
+```bash
+sudo ./scripts/ab_sweep.sh                              # 45s dwell, rate=2000
+sudo RATE=50000 OUT=/tmp/ab_hirate.txt ./scripts/ab_sweep.sh 30
+```
+Use the **50k** rate for anything you intend to quote: at rate=2000 the hot path
+runs at a 0.1% duty cycle, every tick lands on cold caches, and the per-op deltas
+sit below the run-to-run noise floor (ProjectDeepDive §7).
 
 ---
 
@@ -199,7 +213,7 @@ sudo sed -i 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="quiet 
 sudo update-grub
 # undo the runtime CPU tuning (siblings back online, governor back)
 sudo systemctl disable --now trade-ops-cpu.service
-for c in 9 11 13 15; do echo 1 | sudo tee /sys/devices/system/cpu/cpu$c/online; done
+for c in 1 3; do echo 1 | sudo tee /sys/devices/system/cpu/cpu$c/online; done
 sudo reboot     # to fully clear isolcpus/nohz_full/hugepages
 ```
 
